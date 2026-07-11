@@ -1,15 +1,3 @@
-"""
-Institutionelles Trading Signal Server
-=======================================
-Empfängt TradingView Webhooks → prüft alle Filter → sendet Telegram Alarm
-
-Setups:
-- CL H1  | Mom ±15% | Vol | ATR | 2R
-- ES H1  | Mom ±10% | Vol | ATR | 2R
-- ES M30 | Mom ±10% | Vol | ATR | 2R
-- EUR/USD H1 | Overlap | Vol | 1.5R
-"""
-
 from flask import Flask, request, jsonify
 import requests
 import os
@@ -79,7 +67,23 @@ PARAMS = {
 
 BUFFERS = {inst: deque(maxlen=300) for inst in PARAMS}
 TRADE_STATUS = {inst: {"in_trade": False, "bars_since": 0} for inst in PARAMS}
-DAILY_CLOSES = {inst: deque(maxlen=30) for inst in PARAMS}
+
+# Startwerte: letzte 25 Tages-Closes aus Backtest Daten
+DAILY_CLOSES = {
+    "CL_H1": deque([92.78, 88.62, 87.74, 86.97, 91.68, 92.6, 95.41, 92.12, 89.46, 90.49,
+                    87.91, 91.06, 85.63, 83.5, 80.37, 75.83, 75.01, 75.52, 76.54, 74.08,
+                    73.05, 69.87, 71.47, 70.24, 70.84], maxlen=30),
+    "ES_H1": deque([7595.0, 7616.5, 7650.0, 7653.0, 7670.75, 7690.5, 7609.75, 7650.0, 7430.25, 7474.5,
+                    7452.25, 7329.25, 7460.5, 7498.5, 7624.25, 7583.0, 7511.0, 7574.75, 7556.25, 7540.75,
+                    7445.5, 7477.5, 7433.75, 7397.25, 7462.75], maxlen=30),
+    "ES_M30": deque([7595.0, 7616.5, 7650.0, 7653.0, 7670.75, 7690.5, 7609.75, 7650.0, 7430.25, 7474.5,
+                     7452.25, 7329.25, 7460.5, 7498.5, 7624.25, 7583.0, 7511.0, 7574.75, 7556.25, 7540.75,
+                     7445.5, 7477.5, 7433.75, 7397.25, 7462.75], maxlen=30),
+    "EURUSD_H1": deque([1.15989, 1.1614, 1.15226, 1.15115, 1.15372, 1.15394, 1.15358, 1.15774, 1.15669, 1.1606,
+                        1.15904, 1.16091, 1.15038, 1.14623, 1.14712, 1.14622, 1.14284, 1.13837, 1.13586, 1.13732,
+                        1.1385, 1.13838, 1.1426, 1.14224, 1.14078], maxlen=30),
+}
+
 CET = pytz.timezone("Europe/Berlin")
 
 
@@ -209,7 +213,8 @@ def check_signal(inst, bar):
                     if 0 < rk <= mr:
                         status["in_trade"] = True
                         status["bars_since"] = 0
-                        return {"direction": "LONG", "entry": en, "stop": st, "target": en + rk * p["crv"], "inst": inst}
+                        return {"direction": "LONG", "entry": en, "stop": st,
+                                "target": en + rk * p["crv"], "inst": inst}
         for idx in range(swing_bars, n - swing_bars - 1):
             sh = bars[idx]["high"]
             if all(bars[idx-j]["high"] < sh and bars[idx+j]["high"] < sh for j in range(1, swing_bars+1)):
@@ -220,7 +225,8 @@ def check_signal(inst, bar):
                     if 0 < rk <= mr:
                         status["in_trade"] = True
                         status["bars_since"] = 0
-                        return {"direction": "SHORT", "entry": en, "stop": st, "target": en - rk * p["crv"], "inst": inst}
+                        return {"direction": "SHORT", "entry": en, "stop": st,
+                                "target": en - rk * p["crv"], "inst": inst}
     else:
         for i in range(2, min(12, len(bars))):
             liq = bars[-i-1]["low"]
@@ -232,7 +238,8 @@ def check_signal(inst, bar):
                 if 0 < rk <= mr:
                     status["in_trade"] = True
                     status["bars_since"] = 0
-                    return {"direction": "LONG", "entry": en, "stop": st, "target": en + rk * p["crv"], "inst": inst}
+                    return {"direction": "LONG", "entry": en, "stop": st,
+                            "target": en + rk * p["crv"], "inst": inst}
         for i in range(2, min(12, len(bars))):
             liq = bars[-i-1]["high"]
             extr = bars[-i]["high"]
@@ -243,7 +250,8 @@ def check_signal(inst, bar):
                 if 0 < rk <= mr:
                     status["in_trade"] = True
                     status["bars_since"] = 0
-                    return {"direction": "SHORT", "entry": en, "stop": st, "target": en - rk * p["crv"], "inst": inst}
+                    return {"direction": "SHORT", "entry": en, "stop": st,
+                            "target": en - rk * p["crv"], "inst": inst}
 
     return None
 
@@ -278,21 +286,22 @@ def webhook(instrument):
 
     if signal:
         inst_names = {
-            "CL_H1": "🛢️ CL H1",
-            "ES_H1": "📈 ES H1",
-            "ES_M30": "📈 ES M30",
-            "EURUSD_H1": "💱 EUR/USD H1"
+            "CL_H1": "CL H1",
+            "ES_H1": "ES H1",
+            "ES_M30": "ES M30",
+            "EURUSD_H1": "EUR/USD H1"
         }
         emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
         is_forex = "USD" in inst
         fmt = ".4f" if is_forex else ".2f"
+        crv = p["crv"] if (p := PARAMS[inst]) else 2.0
         msg = (
-            f"{emoji} <b>{inst_names[inst]} – {signal['direction']}</b>\n\n"
+            f"{emoji} <b>{inst_names[inst]} - {signal['direction']} SIGNAL</b>\n\n"
             f"<b>Limit Order setzen:</b>\n"
-            f"• Entry:  <code>{signal['entry']:{fmt}}</code>\n"
-            f"• Stop:   <code>{signal['stop']:{fmt}}</code>\n"
-            f"• Target: <code>{signal['target']:{fmt}}</code>\n\n"
-            f"<b>Pepperstone öffnen!</b>\n"
+            f"Entry:  <code>{signal['entry']:{fmt}}</code>\n"
+            f"Stop:   <code>{signal['stop']:{fmt}}</code>\n"
+            f"Target: <code>{signal['target']:{fmt}}</code>\n\n"
+            f"<b>Pepperstone oeffnen und Limit Order platzieren!</b>\n"
             f"Zeit: {datetime.now(CET).strftime('%d.%m.%Y %H:%M')} MEZ"
         )
         send_telegram(msg)
@@ -303,12 +312,21 @@ def webhook(instrument):
 
 @app.route("/status", methods=["GET"])
 def status():
-    return jsonify({inst: {"bars": len(BUFFERS[inst]), "in_trade": TRADE_STATUS[inst]["in_trade"]} for inst in PARAMS})
+    result = {}
+    for inst in PARAMS:
+        mom = calc_momentum_20d(DAILY_CLOSES[inst])
+        result[inst] = {
+            "bars": len(BUFFERS[inst]),
+            "in_trade": TRADE_STATUS[inst]["in_trade"],
+            "momentum_20d": round(mom, 2) if mom else None,
+            "daily_closes": len(DAILY_CLOSES[inst]),
+        }
+    return jsonify(result)
 
 
 @app.route("/test", methods=["GET"])
 def test():
-    sent = send_telegram("✅ Trading Signal Server läuft!\nAlle Systeme aktiv.")
+    sent = send_telegram("Trading Signal Server laeuft!\nAlle Systeme aktiv.\nMomentum Filter sofort bereit!")
     return jsonify({"sent": sent})
 
 
