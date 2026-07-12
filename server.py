@@ -29,7 +29,7 @@ PARAMS = {
         "momentum_min_pct": 0.0071,
         "stop_buffer_pct": 0.0014,
         "max_risk_pct": 0.071,
-        "crv": 2.0,
+        "crv": 1.0,
         "atr_max_pct": 0.0143,
         "atr_pct": True,
         "vol_ma_len": 20,
@@ -42,7 +42,7 @@ PARAMS = {
         "momentum_min_pct": 0.0071,
         "stop_buffer_pct": 0.0014,
         "max_risk_pct": 0.071,
-        "crv": 2.0,
+        "crv": 1.0,
         "atr_max_pct": 0.0143,
         "atr_pct": True,
         "vol_ma_len": 20,
@@ -291,17 +291,17 @@ def webhook(instrument):
             "ES_M30": "ES M30",
             "EURUSD_H1": "EUR/USD H1"
         }
+        crv = PARAMS[inst]["crv"]
         emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
         is_forex = "USD" in inst
         fmt = ".4f" if is_forex else ".2f"
-        crv = p["crv"] if (p := PARAMS[inst]) else 2.0
         msg = (
-            f"{emoji} <b>{inst_names[inst]} - {signal['direction']} SIGNAL</b>\n\n"
+            f"{emoji} <b>{inst_names[inst]} – {signal['direction']} SIGNAL</b>\n\n"
             f"<b>Limit Order setzen:</b>\n"
             f"Entry:  <code>{signal['entry']:{fmt}}</code>\n"
             f"Stop:   <code>{signal['stop']:{fmt}}</code>\n"
-            f"Target: <code>{signal['target']:{fmt}}</code>\n\n"
-            f"<b>Pepperstone oeffnen und Limit Order platzieren!</b>\n"
+            f"Target {crv}R: <code>{signal['target']:{fmt}}</code>\n\n"
+            f"<b>Pepperstone öffnen!</b>\n"
             f"Zeit: {datetime.now(CET).strftime('%d.%m.%Y %H:%M')} MEZ"
         )
         send_telegram(msg)
@@ -318,6 +318,7 @@ def status():
         result[inst] = {
             "bars": len(BUFFERS[inst]),
             "in_trade": TRADE_STATUS[inst]["in_trade"],
+            "crv": PARAMS[inst]["crv"],
             "momentum_20d": round(mom, 2) if mom else None,
             "daily_closes": len(DAILY_CLOSES[inst]),
         }
@@ -326,7 +327,14 @@ def status():
 
 @app.route("/test", methods=["GET"])
 def test():
-    sent = send_telegram("Trading Signal Server laeuft!\nAlle Systeme aktiv.\nMomentum Filter sofort bereit!")
+    sent = send_telegram(
+        "✅ Trading Signal Server läuft!\n\n"
+        "CRV Einstellungen:\n"
+        "• CL H1: 2R\n"
+        "• ES H1: 1R\n"
+        "• ES M30: 1R\n"
+        "• EUR/USD H1: 1.5R"
+    )
     return jsonify({"sent": sent})
 
 
@@ -343,7 +351,11 @@ def reset(instrument):
 
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"status": "running", "message": "Trading Signal Server aktiv!"})
+    return jsonify({
+        "status": "running",
+        "message": "Trading Signal Server aktiv!",
+        "crv": {"CL": "2R", "ES_H1": "1R", "ES_M30": "1R", "EURUSD": "1.5R"}
+    })
 
 
 if __name__ == "__main__":
