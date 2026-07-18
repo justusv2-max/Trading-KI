@@ -9,7 +9,13 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "trading123")
 CET = pytz.timezone("Europe/Berlin")
-CACHE_FILE = "/data/bar_cache.json"
+# Persistenter Speicher: /data (Railway Volume) oder /tmp als Fallback
+if os.path.isdir("/data"):
+    CACHE_FILE = "/data/bar_cache.json"
+else:
+    os.makedirs("/tmp/trading", exist_ok=True)
+    CACHE_FILE = "/tmp/trading/bar_cache.json"
+print("Cache Pfad:", CACHE_FILE)
 
 PARAMS = {
     "CL_H1": {
@@ -44,7 +50,8 @@ def load_cache():
 
 def save_cache():
     try:
-        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        parent = os.path.dirname(CACHE_FILE)
+        if parent: os.makedirs(parent, exist_ok=True)
         with open(CACHE_FILE, "w") as f:
             json.dump({"buffers":{k:list(v) for k,v in BUFFERS.items()},
                        "daily":{k:list(v) for k,v in DAILY_CLOSES.items()}}, f)
