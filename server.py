@@ -41,6 +41,22 @@ DEFAULT_DAILY = {
     "CL_M30": [81.996, 77.371, 76.387, 76.782, 77.687, 74.853, 73.816, 70.578, 72.151, 70.954, 71.022, 70.625, 68.608, 68.951, 69.243, 69.002, 72.554, 74.947, 72.13, 71.773, 78.131, 80.054, 80.386, 79.689, 82.492],
 }
 
+def load_cache():
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE) as f: return json.load(f)
+    except: pass
+    return None
+
+def save_cache():
+    try:
+        parent = os.path.dirname(CACHE_FILE)
+        if parent: os.makedirs(parent, exist_ok=True)
+        with open(CACHE_FILE, "w") as f:
+            json.dump({"buffers":{k:list(v) for k,v in BUFFERS.items()},
+                       "daily":{k:list(v) for k,v in DAILY_CLOSES.items()}}, f)
+    except Exception as e: print("Cache Fehler:", e)
+
 cache = load_cache()
 if cache:
     print("Cache geladen - echte Preise aktiv!")
