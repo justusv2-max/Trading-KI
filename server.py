@@ -183,8 +183,20 @@ def webhook(instrument):
             "open": float(data["open"]), "high": float(data["high"]),
             "low": float(data["low"]), "close": float(data["close"]),
             "volume": float(data["volume"])}
+        # Nur Tages-Schlusskerze als Daily Close speichern
+        # Letzte Kerze des Tages = 21:30 MEZ (M30) oder 21:00 MEZ (H1)
         if data.get("daily_close"):
-            SHARED_DAILY.append(float(data["daily_close"]))
+            bar_time = datetime.fromtimestamp(bar["timestamp"], tz=timezone.utc).astimezone(CET)
+            bar_hour = bar_time.hour
+            bar_min  = bar_time.minute
+            # Nur speichern wenn es die letzte Handelskerze des Tages ist
+            # M30: 21:30 Kerze | H1: 21:00 Kerze
+            if (bar_hour == 21 and bar_min == 30) or (bar_hour == 21 and bar_min == 0):
+                close_val = float(data["daily_close"])
+                # Nur hinzufuegen wenn neuer Tag
+                if len(SHARED_DAILY) == 0 or SHARED_DAILY[-1] != close_val:
+                    SHARED_DAILY.append(close_val)
+                    print(f"Daily Close gespeichert: {close_val}")
     except Exception as e: return jsonify({"error": str(e)}), 400
     BUFFERS[inst].append(bar)
     # Offene Trades aktualisieren
