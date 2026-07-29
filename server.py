@@ -214,11 +214,16 @@ def webhook(instrument):
         # Nur Tages-Schlusskerze als Daily Close speichern (21:30 M30 oder 21:00 H1)
         if data.get("daily_close"):
             bar_time = datetime.fromtimestamp(bar["timestamp"], tz=timezone.utc).astimezone(CET)
-            if (bar_time.hour == 21 and bar_time.minute == 30) or (bar_time.hour == 21 and bar_time.minute == 0):
+            # Letzte Kerze des Tages = Markt schliesst um 23:00 MEZ
+            # M30: letzte Kerze startet 22:30 MEZ
+            # H1: letzte Kerze startet 22:00 MEZ
+            # Beide schliessen um 23:00 MEZ - identisch mit Backtest daily close
+            is_last_bar = (bar_time.hour == 22 and bar_time.minute == 30) or (bar_time.hour == 22 and bar_time.minute == 0)
+            if is_last_bar:
                 close_val = float(data["daily_close"])
                 if len(SHARED_DAILY) == 0 or SHARED_DAILY[-1] != close_val:
                     SHARED_DAILY.append(close_val)
-                    print(f"Daily Close gespeichert: {close_val}")
+                    print(f"Tages-Close gespeichert ({bar_time.strftime('%d.%m %H:%M')}): {close_val}")
     except Exception as e: return jsonify({"error": str(e)}), 400
     BUFFERS[inst].append(bar)
     update_open_trades(inst, bar)
@@ -325,3 +330,4 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
