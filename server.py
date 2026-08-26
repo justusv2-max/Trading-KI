@@ -564,7 +564,9 @@ def webhook():
         l = float(data['l'])
         c = float(data['c'])
         v = float(data.get('v', 0))
-        ts = float(data['t'])  # Unix Timestamp (Sekunden)
+        # Timestamp optional - Server nutzt eigene Zeit
+        import time as time_module
+        ts = float(data.get('t', time_module.time()))
 
         # Session Check
         if not in_session(ts):
