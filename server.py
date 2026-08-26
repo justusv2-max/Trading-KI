@@ -766,7 +766,7 @@ def daily_update():
 # ══════════════════════════════════════════
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"System 1+2 CL Futures M5 Server v2.0")
+    print(f"System 1+2 CL Futures M5 Server v2.0 | Port {port}")
     print(f"Port: {port}")
     print(f"Telegram: {'✅' if TELEGRAM_TOKEN else '❌ nicht konfiguriert'}")
     print(f"Parameter:")
