@@ -19,6 +19,40 @@ import json, os, datetime, math
 from collections import deque
 from zoneinfo import ZoneInfo
 
+
+# ══════════════════════════════════════════
+# INITIALE DAILY DATEN (letzte 25 Handelstage)
+# Wird beim Server-Start automatisch geladen!
+# → Kein manuelles /init nötig!
+# ══════════════════════════════════════════
+INITIAL_DAYS = [
+    {"date":"2026-07-29","h":85.57,"l":81.51,"c":84.05},
+    {"date":"2026-07-30","h":85.94,"l":81.60,"c":81.66},
+    {"date":"2026-07-31","h":86.87,"l":81.06,"c":86.80},
+    {"date":"2026-08-02","h":81.30,"l":78.78,"c":79.52},
+    {"date":"2026-08-03","h":81.30,"l":78.43,"c":81.23},
+    {"date":"2026-08-04","h":82.33,"l":74.24,"c":75.15},
+    {"date":"2026-08-05","h":76.70,"l":74.45,"c":74.81},
+    {"date":"2026-08-06","h":78.77,"l":74.57,"c":78.32},
+    {"date":"2026-08-07","h":78.50,"l":76.53,"c":77.08},
+    {"date":"2026-08-09","h":79.43,"l":78.18,"c":78.45},
+    {"date":"2026-08-10","h":82.52,"l":77.79,"c":82.24},
+    {"date":"2026-08-11","h":84.61,"l":81.27,"c":83.70},
+    {"date":"2026-08-12","h":84.10,"l":81.90,"c":83.00},
+    {"date":"2026-08-13","h":83.30,"l":80.09,"c":81.38},
+    {"date":"2026-08-14","h":82.99,"l":80.76,"c":82.40},
+    {"date":"2026-08-16","h":83.04,"l":81.72,"c":82.15},
+    {"date":"2026-08-17","h":85.04,"l":81.50,"c":84.34},
+    {"date":"2026-08-18","h":85.14,"l":83.78,"c":84.61},
+    {"date":"2026-08-19","h":85.84,"l":83.45,"c":84.47},
+    {"date":"2026-08-20","h":87.69,"l":84.33,"c":86.24},
+    {"date":"2026-08-21","h":87.51,"l":85.80,"c":86.64},
+    {"date":"2026-08-23","h":86.57,"l":84.84,"c":85.61},
+    {"date":"2026-08-24","h":86.24,"l":84.36,"c":85.08},
+    {"date":"2026-08-25","h":85.09,"l":80.08,"c":80.61},
+    {"date":"2026-08-26","h":80.94,"l":80.28,"c":80.60},
+]
+
 app = Flask(__name__)
 
 # ══════════════════════════════════════════
@@ -163,6 +197,73 @@ class DailyCache:
         return mom_atr, trend_up, sideway_ok, s2_ok
 
 daily_cache = DailyCache()
+
+# ══════════════════════════════════════════
+# PERSISTENTER SPEICHER FÜR DAILY CACHE
+# Speichert täglich in JSON Datei
+# Bei Neustart: Datei laden → sofort bereit!
+# ══════════════════════════════════════════
+CACHE_FILE = "daily_cache.json"
+
+def save_cache():
+    """Speichert Daily Cache in JSON Datei"""
+    try:
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(daily_cache.days, f)
+        print(f"[CACHE] Gespeichert: {len(daily_cache.days)} Tage")
+    except Exception as e:
+        print(f"[CACHE] Fehler beim Speichern: {e}")
+
+def load_cache():
+    """Lädt Daily Cache aus JSON Datei beim Start"""
+    try:
+        with open(CACHE_FILE, 'r') as f:
+            days = json.load(f)
+        daily_cache.days = days[-50:]  # Max 50 Tage
+        print(f"[CACHE] Geladen: {len(daily_cache.days)} Tage aus Datei")
+        return True
+    except FileNotFoundError:
+        print("[CACHE] Keine Cache Datei gefunden → verwende Initial-Daten")
+        return False
+    except Exception as e:
+        print(f"[CACHE] Fehler beim Laden: {e}")
+        return False
+
+def auto_init():
+    """
+    Beim Server-Start:
+    1. Versuche Cache aus Datei zu laden
+    2. Falls keine Datei: nutze Initial-Daten
+    3. Berechne Momentum und logge Status
+    """
+    loaded = load_cache()
+
+    if not loaded or len(daily_cache.days) < MOM_DAYS + 1:
+        # Keine oder zu wenige Daten → Initial-Daten verwenden
+        print("[CACHE] Lade Initial-Daten...")
+        daily_cache.days = []
+        for d in INITIAL_DAYS:
+            daily_cache.days.append({
+                'date': d['date'],
+                'h': d['h'],
+                'l': d['l'],
+                'c': d['c']
+            })
+        save_cache()  # Sofort speichern
+        print(f"[CACHE] Initial-Daten geladen: {len(daily_cache.days)} Tage")
+
+    # Momentum berechnen und loggen
+    mom_atr, trend_up, sideway_ok, s2_ok = daily_cache.get_momentum()
+    if mom_atr:
+        system = "S1 Seitwärts" if sideway_ok else "S2 Trend"
+        direction = "UP" if trend_up else "DOWN"
+        print(f"[AUTO-INIT] ATR-Mom: {mom_atr:.2f}x | {system} | Trend {direction}")
+        print(f"[AUTO-INIT] Letzter Tag: {daily_cache.days[-1]['date']} | Close: {daily_cache.days[-1]['c']}")
+    else:
+        print("[AUTO-INIT] Warnung: Nicht genug Daten für Momentum!")
+
+# Sofort beim Start ausführen
+auto_init()
 
 # ══════════════════════════════════════════
 # ATR M5 BERECHNUNG
