@@ -653,6 +653,114 @@ def health():
         "version": "2.0"
     }), 200
 
+
+# ══════════════════════════════════════════
+# INIT – Daily Cache befüllen beim Start
+# Schicke letzte 25 Daily Closes als JSON:
+# POST /init
+# {"days": [
+#   {"date":"2026-08-01","h":83.5,"l":81.2,"c":82.1},
+#   {"date":"2026-08-04","h":84.1,"l":82.8,"c":83.5},
+#   ...
+# ]}
+# ══════════════════════════════════════════
+@app.route("/init", methods=["POST"])
+def init():
+    """Befüllt Daily Cache mit historischen Daten"""
+    try:
+        data = json.loads(request.get_data(as_text=True))
+        days = data.get("days", [])
+
+        if len(days) < MOM_DAYS + 1:
+            return jsonify({
+                "status": "error",
+                "message": f"Brauche mindestens {MOM_DAYS+1} Tage, erhalten: {len(days)}"
+            }), 400
+
+        # Cache befüllen
+        daily_cache.days = []
+        for d in days:
+            daily_cache.days.append({
+                'date': d['date'],
+                'h': float(d['h']),
+                'l': float(d['l']),
+                'c': float(d['c'])
+            })
+
+        # Momentum berechnen
+        mom_atr, trend_up, sideway_ok, s2_ok = daily_cache.get_momentum()
+
+        msg = (
+            f"✅ <b>Daily Cache initialisiert</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 {len(days)} Tage geladen\n"
+            f"📈 ATR-Mom: {mom_atr:.2f}×\n"
+            f"{'✅ Seitwärts (S1 aktiv)' if sideway_ok else '✅ Trend (S2 aktiv)'}\n"
+            f"{'📈 Aufwärtstrend' if trend_up else '📉 Abwärtstrend'}\n"
+            f"🕐 {datetime.datetime.now(CET).strftime('%H:%M MEZ')}"
+        )
+        send_telegram(msg)
+
+        return jsonify({
+            "status": "ok",
+            "days_loaded": len(days),
+            "mom_atr": round(mom_atr, 2) if mom_atr else None,
+            "sideway": sideway_ok,
+            "trend": s2_ok,
+            "trend_up": trend_up
+        }), 200
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# ══════════════════════════════════════════
+# DAILY UPDATE – Tagesabschluss
+# TradingView Daily Alert sendet:
+# {"date":"2026-08-26","h":83.5,"l":81.2,"c":82.1}
+# ══════════════════════════════════════════
+@app.route("/daily", methods=["POST"])
+def daily_update():
+    """Empfängt täglichen Abschlusskurs von TradingView"""
+    try:
+        data = json.loads(request.get_data(as_text=True))
+        h = float(data['h'])
+        l = float(data['l'])
+        c = float(data['c'])
+        date = data.get('date', datetime.datetime.now(CET).date().isoformat())
+
+        # Zum Cache hinzufügen
+        daily_cache.days.append({'date': date, 'h': h, 'l': l, 'c': c})
+        if len(daily_cache.days) > 50:
+            daily_cache.days = daily_cache.days[-50:]
+
+        # Neues Momentum berechnen
+        mom_atr, trend_up, sideway_ok, s2_ok = daily_cache.get_momentum()
+
+        print(f"[DAILY] {date} | H:{h} L:{l} C:{c} | ATR-Mom:{mom_atr:.2f}×")
+
+        if mom_atr:
+            msg = (
+                f"📅 <b>Tagesabschluss {date}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 Close: ${c:.2f}\n"
+                f"📊 ATR-Mom: {mom_atr:.2f}×ATR\n"
+                f"{'✅ Morgen: System 1 (Seitwärts)' if sideway_ok else '✅ Morgen: System 2 (Trend)'}\n"
+                f"{'📈 Trend UP' if trend_up else '📉 Trend DOWN'}"
+            )
+            send_telegram(msg)
+
+        return jsonify({
+            "status": "ok",
+            "date": date,
+            "close": c,
+            "mom_atr": round(mom_atr, 2) if mom_atr else None,
+            "tomorrow_system": "S1" if sideway_ok else "S2"
+        }), 200
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 # ══════════════════════════════════════════
 # START
 # ══════════════════════════════════════════
