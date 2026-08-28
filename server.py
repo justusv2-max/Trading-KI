@@ -26,31 +26,36 @@ from zoneinfo import ZoneInfo
 # → Kein manuelles /init nötig!
 # ══════════════════════════════════════════
 INITIAL_DAYS = [
+    {"date":"2026-07-24","h":91.86,"l":87.68,"c":90.47},
+    {"date":"2026-07-26","h":86.2,"l":83.1,"c":84.84},
+    {"date":"2026-07-27","h":84.96,"l":80.6,"c":81.63},
+    {"date":"2026-07-28","h":83.3,"l":77.78,"c":82.04},
     {"date":"2026-07-29","h":85.57,"l":81.51,"c":84.05},
-    {"date":"2026-07-30","h":85.94,"l":81.60,"c":81.66},
-    {"date":"2026-07-31","h":86.87,"l":81.06,"c":86.80},
-    {"date":"2026-08-02","h":81.30,"l":78.78,"c":79.52},
-    {"date":"2026-08-03","h":81.30,"l":78.43,"c":81.23},
+    {"date":"2026-07-30","h":85.94,"l":81.6,"c":81.66},
+    {"date":"2026-07-31","h":86.87,"l":81.06,"c":86.8},
+    {"date":"2026-08-02","h":81.3,"l":78.78,"c":79.52},
+    {"date":"2026-08-03","h":81.3,"l":78.43,"c":81.23},
     {"date":"2026-08-04","h":82.33,"l":74.24,"c":75.15},
-    {"date":"2026-08-05","h":76.70,"l":74.45,"c":74.81},
+    {"date":"2026-08-05","h":76.7,"l":74.45,"c":74.81},
     {"date":"2026-08-06","h":78.77,"l":74.57,"c":78.32},
-    {"date":"2026-08-07","h":78.50,"l":76.53,"c":77.08},
+    {"date":"2026-08-07","h":78.5,"l":76.53,"c":77.08},
     {"date":"2026-08-09","h":79.43,"l":78.18,"c":78.45},
     {"date":"2026-08-10","h":82.52,"l":77.79,"c":82.24},
-    {"date":"2026-08-11","h":84.61,"l":81.27,"c":83.70},
-    {"date":"2026-08-12","h":84.10,"l":81.90,"c":83.00},
-    {"date":"2026-08-13","h":83.30,"l":80.09,"c":81.38},
-    {"date":"2026-08-14","h":82.99,"l":80.76,"c":82.40},
+    {"date":"2026-08-11","h":84.61,"l":81.27,"c":83.7},
+    {"date":"2026-08-12","h":84.1,"l":81.9,"c":83.0},
+    {"date":"2026-08-13","h":83.3,"l":80.09,"c":81.38},
+    {"date":"2026-08-14","h":82.99,"l":80.76,"c":82.4},
     {"date":"2026-08-16","h":83.04,"l":81.72,"c":82.15},
-    {"date":"2026-08-17","h":85.04,"l":81.50,"c":84.34},
+    {"date":"2026-08-17","h":85.04,"l":81.5,"c":84.34},
     {"date":"2026-08-18","h":85.14,"l":83.78,"c":84.61},
     {"date":"2026-08-19","h":85.84,"l":83.45,"c":84.47},
     {"date":"2026-08-20","h":87.69,"l":84.33,"c":86.24},
-    {"date":"2026-08-21","h":87.51,"l":85.80,"c":86.64},
+    {"date":"2026-08-21","h":87.51,"l":85.8,"c":86.64},
     {"date":"2026-08-23","h":86.57,"l":84.84,"c":85.61},
     {"date":"2026-08-24","h":86.24,"l":84.36,"c":85.08},
     {"date":"2026-08-25","h":85.09,"l":80.08,"c":80.61},
-    {"date":"2026-08-26","h":80.94,"l":80.28,"c":80.60},
+    {"date":"2026-08-26","h":83.31,"l":79.62,"c":81.83},
+    {"date":"2026-08-27","h":84.27,"l":80.65,"c":83.27},
 ]
 
 app = Flask(__name__)
@@ -158,6 +163,7 @@ class DailyCache:
         Berechnet ATR-Momentum für HEUTE (basierend auf gestern!)
         → Identisch mit Backtest: close[1] / ATR_Daily[1]
         → Konstant für ganzen Tag (keine Intraday Schwankung)
+        → True Range = max(H-L, |H-Cprev|, |L-Cprev|)
 
         Returns: (mom_atr, trend_up, sideway_ok, s2_ok)
         """
@@ -173,11 +179,19 @@ class DailyCache:
             return None, None, False, False
         close_n_ago = self.days[-(MOM_DAYS + 1)]['c']
 
-        # ATR Daily (14 Tage) – gestriger Wert
-        atr_days = self.days[-(ATR_LEN):]
-        if len(atr_days) < ATR_LEN:
+        # ATR Daily (14 Tage) – True Range wie Python Backtest!
+        # True Range = max(H-L, |H-Cprev|, |L-Cprev|)
+        atr_days = self.days[-(ATR_LEN + 1):]
+        if len(atr_days) < ATR_LEN + 1:
             return None, None, False, False
-        atr_daily = sum(d['h'] - d['l'] for d in atr_days) / ATR_LEN
+        true_ranges = []
+        for i in range(1, len(atr_days)):
+            h = atr_days[i]['h']
+            l = atr_days[i]['l']
+            c_prev = atr_days[i-1]['c']
+            tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
+            true_ranges.append(tr)
+        atr_daily = sum(true_ranges) / len(true_ranges)
 
         if atr_daily <= 0:
             return None, None, False, False
