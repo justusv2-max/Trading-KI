@@ -179,6 +179,9 @@ def zone_reset():
     short_zones.clear()
     print("[ZONE] Zone Lock resettet")
 
+# Session Tracking für Reset
+prev_session = None
+
 # ─── TAGES-RESET ───────────────────────────────────────────
 current_date = None
 sig_today    = []
@@ -320,14 +323,32 @@ def webhook():
             d = json.loads(raw)
         except Exception as je:
             print(f"[JSON ERR] {je} | raw: {raw[:100]}")
-            return jsonify({"status":"ok","msg":"json parse error"}), 200
+            # TV sendet "t":2026-09-04T09:50:00Z ohne Quotes -> fix
+            import re as _re
+            fixed = _re.sub(r'"t":([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z)', r'"t":"\1"', raw)
+            try:
+                d = json.loads(fixed)
+                print("[JSON FIX] OK")
+            except:
+                return jsonify({"status":"ok","msg":"json parse error"}), 200
         o  = float(d.get('o', d.get('open', 0)))
         h  = float(d.get('h', d.get('high', 0)))
         l  = float(d.get('l', d.get('low', 0)))
         c  = float(d.get('c', d.get('close', 0)))
         v  = float(d.get('v', d.get('volume', 0)))
-        # Timestamp: Server nutzt eigene Zeit (CET→CT konvertiert)
-        ts = time_module.time()
+        # Timestamp: aus TV ISO String oder Serverzeit
+        import time as _t
+        t_raw = d.get('t', '')
+        if t_raw and isinstance(t_raw, str) and 'T' in str(t_raw):
+            try:
+                from datetime import datetime, timezone
+                ts = datetime.strptime(str(t_raw).replace('Z',''), '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).timestamp()
+            except:
+                ts = _t.time()
+        elif t_raw and str(t_raw).isdigit():
+            ts = float(t_raw)
+        else:
+            ts = _t.time()
         if o==0 and h==0 and l==0 and c==0:
             return jsonify({"status":"ok","msg":"invalid prices"}), 200
 
@@ -345,6 +366,16 @@ def webhook():
         # Session
         sess = "EU Session" if in_eu(ts) else ("US Session" if in_us(ts) else "")
         in_session = in_any(ts)
+
+        # Zone Lock Reset bei Session-Wechsel!
+        global prev_session
+        curr_sess = "EU" if in_eu(ts) else ("US" if in_us(ts) else None)
+        if curr_sess is not None and curr_sess != prev_session:
+            zone_reset()
+            print(f"[SESSION] {prev_session} → {curr_sess} | Zone Lock resettet!")
+            prev_session = curr_sess
+
+
 
         # Momentum
         mom, up, s1, s2 = momentum()
