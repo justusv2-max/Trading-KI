@@ -326,7 +326,8 @@ def webhook():
         l  = float(d.get('l', d.get('low', 0)))
         c  = float(d.get('c', d.get('close', 0)))
         v  = float(d.get('v', d.get('volume', 0)))
-        ts = float(d.get('t', d.get('time', time_module.time())))
+        # Timestamp: Server nutzt eigene Zeit (CET→CT konvertiert)
+        ts = time_module.time()
         if o==0 and h==0 and l==0 and c==0:
             return jsonify({"status":"ok","msg":"invalid prices"}), 200
 
