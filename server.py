@@ -312,11 +312,23 @@ def fmt(sig, mom, atr, sess):
 def webhook():
     global bar_num
     try:
-        d  = json.loads(request.get_data(as_text=True))
-        o  = float(d['o']); h = float(d['h'])
-        l  = float(d['l']); c = float(d['c'])
-        v  = float(d.get('v', 0))
-        ts = float(d.get('t', time_module.time()))
+        raw = request.get_data(as_text=True)
+        print(f"[RECV] {raw[:200]}")
+        if not raw or not raw.strip():
+            return jsonify({"status":"ok","msg":"empty body"}), 200
+        try:
+            d = json.loads(raw)
+        except Exception as je:
+            print(f"[JSON ERR] {je} | raw: {raw[:100]}")
+            return jsonify({"status":"ok","msg":"json parse error"}), 200
+        o  = float(d.get('o', d.get('open', 0)))
+        h  = float(d.get('h', d.get('high', 0)))
+        l  = float(d.get('l', d.get('low', 0)))
+        c  = float(d.get('c', d.get('close', 0)))
+        v  = float(d.get('v', d.get('volume', 0)))
+        ts = float(d.get('t', d.get('time', time_module.time())))
+        if o==0 and h==0 and l==0 and c==0:
+            return jsonify({"status":"ok","msg":"invalid prices"}), 200
 
         if not weekday(ts):
             return jsonify({"status":"ok","msg":"weekend"}), 200
