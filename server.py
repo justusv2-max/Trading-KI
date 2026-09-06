@@ -788,49 +788,6 @@ def reset_endpoint():
         return jsonify({"status":"ok", "msg":"day stats + zones reset"}), 200
 
 
-@app.route("/", methods=["GET"])
-def root():
-    return jsonify({
-        "status":"online",
-        "version":"5.1",
-        "links":{
-            "status":"/status",
-            "test":"/test",
-            "health":"/health",
-            "webhook":"/webhook",
-            "daily":"/daily",
-            "reset":"/reset",
-        }
-    }), 200
-
-
-@app.route("/test", methods=["GET", "POST"])
-def test_endpoint():
-    with LOCK:
-        mom, up, s1, s2 = momentum()
-        now = dt.datetime.now(CET)
-        system = "S1 Seitwärts" if s1 else ("S2 Trend" if s2 else "Warmup")
-        mom_txt = f"{mom:.2f}×" if mom is not None else "n/a"
-        ok = tg(
-            f"🧪 <b>CL System 1+2 v5.1</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ Server Online\n"
-            f"📊 Cache: {len(days)} Tage | letzter: {days[-1]['date'] if days else '-'}\n"
-            f"📈 ATR-Mom: {mom_txt} → {system}\n"
-            f"🕐 {now.strftime('%H:%M %Z')}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"EU Session: 02:00-08:30 CT ✅\n"
-            f"US Session: 08:30-14:00 CT ✅\n"
-            f"Session Reset: aktiv ✅\n"
-            f"Backtest-Logik: unverändert ✅"
-        )
-        return jsonify({
-            "status":"ok",
-            "telegram":"ok" if ok else "error",
-            "version":"5.1"
-        }), 200
-
-
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status":"ok", "version":"5.1"}), 200
