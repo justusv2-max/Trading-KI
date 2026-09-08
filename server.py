@@ -1,5 +1,5 @@
 """
-CL Futures M5 | System 1+2 | Server v5.1
+CL Futures M5 | System 1+2 | Server v5.1.1
 =========================================
 ZIEL
 ----
@@ -23,6 +23,8 @@ TECHNISCHE VERBESSERUNGEN:
 - Duplicate- und Out-of-order-M5-Schutz
 - atomar persistierter Runtime-State (Bars, Zonen, Session, Tagesstatus)
 - persistierter Daily-Cache in demselben State
+- Daily H/L/C wird automatisch aus den eingehenden M5-Bars aufgebaut
+  (Backtest-Tag = date(America/New_York - 1h), also 01:00 ET bis 00:55 ET)
 - Input-/OHLC-Validierung
 - Thread-Lock gegen parallele Requests innerhalb eines Workers
 - Status zeigt tatsächliche Bars des CT-Tages statt globalen Barzähler
@@ -61,6 +63,7 @@ STATE_FILE = Path(os.environ.get("STATE_FILE", "cl_v5_1_state.json"))
 
 CET = ZoneInfo("Europe/Berlin")
 CT = ZoneInfo("America/Chicago")
+ET = ZoneInfo("America/New_York")
 UTC = dt.timezone.utc
 
 # ─── PARAMETER: NICHT ÄNDERN OHNE NEUEN BACKTEST ─────────
@@ -119,6 +122,24 @@ INITIAL_DAYS = [
     {"date":"2026-09-04","h":91.78,"l":88.72,"c":91.22},
 ]
 
+# Geschlossene Custom-Dailys seit dem letzten v5.1-Seed. Diese Werte wurden
+# aus dem TradingView-M5-Export exakt mit derselben Backtest-Gruppierung
+# date(ET - 1h) gebildet. Sie dienen nur der einmaligen Migration eines alten
+# v5.1-States; künftige Tage werden automatisch aus M5 aufgebaut.
+DAILY_MIGRATION_SEED = [
+    {"date":"2026-09-06","h":92.60,"l":91.58,"c":92.46},
+    {"date":"2026-09-07","h":93.29,"l":90.87,"c":93.06},
+]
+
+# Snapshot des aktuell laufenden Custom-Tages aus dem neuesten M5-Export
+# (2026-09-08 01:00 ET bis 04:50 ET). Bei bestehendem persistenten State wird
+# stattdessen aus den dort gespeicherten Bars rekonstruiert. Neue M5-Bars
+# aktualisieren H/L/C anschließend automatisch weiter.
+ACTIVE_DAILY_BOOTSTRAP = {
+    "date":"2026-09-08","h":94.73,"l":92.97,"c":94.51,
+    "last_ts":1788857400.0,
+}
+
 # ─── RUNTIME STATE ────────────────────────────────────────
 bars = deque(maxlen=600)
 days = []
@@ -133,6 +154,7 @@ wins_today = 0
 losses_today = 0
 last_bar_ts = None
 recent_bar_ts = deque(maxlen=2000)
+active_daily = None
 
 
 def _state_dict():
@@ -151,6 +173,7 @@ def _state_dict():
         "losses_today": losses_today,
         "last_bar_ts": last_bar_ts,
         "recent_bar_ts": list(recent_bar_ts),
+        "active_daily": active_daily,
     }
 
 
@@ -176,10 +199,12 @@ def save_state():
 def load_state():
     global days, long_zones, short_zones, bar_num, bars_today
     global prev_session, current_date, sig_today, wins_today, losses_today
-    global last_bar_ts
+    global last_bar_ts, active_daily
 
     if not STATE_FILE.exists():
         days = [dict(x) for x in INITIAL_DAYS]
+        _migrate_daily_seed()
+        active_daily = dict(ACTIVE_DAILY_BOOTSTRAP)
         save_state()
         print(f"[STATE] neu | {len(days)} Initial-Tage")
         return
@@ -201,6 +226,9 @@ def load_state():
         last_bar_ts = s.get("last_bar_ts")
         recent_bar_ts.clear()
         recent_bar_ts.extend(s.get("recent_bar_ts", [])[-2000:])
+        active_daily = s.get("active_daily")
+        _migrate_daily_seed()
+        _rebuild_or_bootstrap_active_daily()
         print(f"[STATE] geladen | bars={len(bars)} days={len(days)} last_ts={last_bar_ts}")
     except Exception as e:
         raise RuntimeError(f"State-Datei unlesbar: {STATE_FILE}: {e}") from e
@@ -298,6 +326,108 @@ def atr_m5():
         for i in range(1, len(b))
     ]
     return sum(trs[-ATR_LEN:]) / ATR_LEN
+
+
+def backtest_daily_date(ts):
+    """Exakte Daily-Gruppierung des Backtests: date(ET timestamp - 1h)."""
+    x = dt.datetime.fromtimestamp(float(ts), tz=ET) - dt.timedelta(hours=1)
+    return x.date().isoformat()
+
+
+def _upsert_day_no_save(row):
+    global days
+    by_date = {d["date"]: d for d in days}
+    by_date[str(row["date"])] = {
+        "date": str(row["date"]),
+        "h": float(row["h"]),
+        "l": float(row["l"]),
+        "c": float(row["c"]),
+    }
+    days = [by_date[k] for k in sorted(by_date.keys())][-50:]
+
+
+def _migrate_daily_seed():
+    """Füllt nur fehlende geschlossene Tage; überschreibt vorhandene Tage nicht."""
+    existing = {d["date"] for d in days}
+    for row in DAILY_MIGRATION_SEED:
+        if row["date"] not in existing:
+            _upsert_day_no_save(row)
+            existing.add(row["date"])
+            print(f"[DAILY-MIGRATION] {row['date']} ergänzt")
+
+
+def _aggregate_bars_for_daily(key):
+    selected = [b for b in bars if backtest_daily_date(b["ts"]) == key]
+    if not selected:
+        return None
+    selected.sort(key=lambda b: b["ts"])
+    return {
+        "date": key,
+        "h": max(float(b["h"]) for b in selected),
+        "l": min(float(b["l"]) for b in selected),
+        "c": float(selected[-1]["c"]),
+        "last_ts": float(selected[-1]["ts"]),
+    }
+
+
+def _rebuild_or_bootstrap_active_daily():
+    """Rekonstruiert den laufenden Custom-Day aus State-Bars, sonst Bootstrap."""
+    global active_daily
+    if last_bar_ts is not None:
+        key = backtest_daily_date(last_bar_ts)
+        rebuilt = _aggregate_bars_for_daily(key)
+        if rebuilt is not None:
+            # Falls derselbe Tag per Bootstrap einen früheren, vollständigeren
+            # Ausschnitt enthält, H/L zusammenführen und den neueren Close nehmen.
+            if ACTIVE_DAILY_BOOTSTRAP.get("date") == key:
+                boot = ACTIVE_DAILY_BOOTSTRAP
+                rebuilt["h"] = max(rebuilt["h"], float(boot["h"]))
+                rebuilt["l"] = min(rebuilt["l"], float(boot["l"]))
+                if float(boot.get("last_ts", 0)) > rebuilt["last_ts"]:
+                    rebuilt["c"] = float(boot["c"])
+                    rebuilt["last_ts"] = float(boot["last_ts"])
+            active_daily = rebuilt
+            return
+    if active_daily is None:
+        active_daily = dict(ACTIVE_DAILY_BOOTSTRAP)
+
+
+def update_daily_from_m5(h, l, c, ts):
+    """Baut Daily H/L/C aus JEDEM M5-Bar, auch Sonntag/Weekend.
+
+    Der vorherige Custom-Day wird beim ersten Bar mit neuem Daily-Key finalisiert.
+    Damit verwendet momentum() während eines laufenden Tages ausschließlich
+    abgeschlossene Dailys – identisch zum Backtest.
+    """
+    global active_daily
+    key = backtest_daily_date(ts)
+    h, l, c, ts = float(h), float(l), float(c), float(ts)
+
+    if active_daily is None:
+        active_daily = {"date": key, "h": h, "l": l, "c": c, "last_ts": ts}
+        return False
+
+    cur = str(active_daily["date"])
+    if key < cur:
+        # Out-of-order wird bereits im Webhook abgefangen; zusätzliche Sicherung.
+        return False
+
+    if key != cur:
+        _upsert_day_no_save(active_daily)
+        print(
+            f"[DAILY-AUTO] final {cur} "
+            f"H:{active_daily['h']} L:{active_daily['l']} C:{active_daily['c']}"
+        )
+        active_daily = {"date": key, "h": h, "l": l, "c": c, "last_ts": ts}
+        return True
+
+    active_daily["h"] = max(float(active_daily["h"]), h)
+    active_daily["l"] = min(float(active_daily["l"]), l)
+    # Nur der zeitlich neueste Bar darf den Close setzen.
+    if ts >= float(active_daily.get("last_ts", -1)):
+        active_daily["c"] = c
+        active_daily["last_ts"] = ts
+    return False
 
 
 def momentum():
@@ -583,8 +713,15 @@ def webhook():
                     "last_bar_ts": last_bar_ts,
                 }), 200
 
+            # Daily-Aggregation läuft ausnahmslos für jeden M5-Bar, inklusive
+            # Sonntag. Das ist für die Backtest-Daily-Gruppierung erforderlich.
+            update_daily_from_m5(h, l, c, ts)
+
             if not weekday(ts):
-                return jsonify({"status": "ok", "msg": "weekend"}), 200
+                recent_bar_ts.append(ts_key)
+                last_bar_ts = ts
+                save_state()
+                return jsonify({"status": "ok", "msg": "weekend daily-only", "daily_key": backtest_daily_date(ts)}), 200
 
             check_new_day(ts)
 
@@ -645,7 +782,7 @@ def webhook():
             save_state()
             return jsonify({
                 "status":"ok",
-                "version":"5.1",
+                "version":"5.1.1",
                 "bar_ts":int(ts),
                 "session":sess,
                 "mom_atr":round(mom,2),
@@ -669,6 +806,15 @@ def webhook():
 
 @app.route("/daily", methods=["POST"])
 def daily_endpoint():
+    # Seit v5.1.1 wird Daily exakt aus M5 aufgebaut. Einen nativen TradingView-D1
+    # hier einzuspeisen würde die Backtest-Gruppierung überschreiben.
+    return jsonify({
+        "status":"disabled",
+        "msg":"Daily wird automatisch aus M5 aufgebaut; D1-Alarm deaktiviert lassen.",
+    }), 409
+
+
+def _legacy_daily_endpoint_disabled():
     with LOCK:
         try:
             d = parse_json_body()
@@ -743,7 +889,7 @@ def status():
         now = dt.datetime.now(CET)
         return jsonify({
             "status":"online",
-            "version":"5.1",
+            "version":"5.1.1",
             "time_local":now.isoformat(),
             "trade_date_ct":current_date,
             "sessions_ct":{"eu":"02:00-08:30", "us":"08:30-14:00"},
@@ -756,6 +902,11 @@ def status():
                 "s1":s1,
                 "s2":s2,
                 "trend_up":up,
+                "source":"auto_from_m5",
+                "active_day":active_daily.get("date") if active_daily else None,
+                "active_h":round(float(active_daily["h"]),2) if active_daily else None,
+                "active_l":round(float(active_daily["l"]),2) if active_daily else None,
+                "active_c":round(float(active_daily["c"]),2) if active_daily else None,
             },
             "atr_filter":f"<= {ATR_MAX}$ (v5.0 semantics)",
             "bars_today":bars_today,
@@ -791,7 +942,7 @@ def reset_endpoint():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status":"ok", "version":"5.1"}), 200
+    return jsonify({"status":"ok", "version":"5.1.1"}), 200
 
 
 load_state()
