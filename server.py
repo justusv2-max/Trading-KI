@@ -1,651 +1,174 @@
-"""
-CL Futures M5 | System 1+2 | Server v5.1.1
-=========================================
-ZIEL
-----
-Technisch robustere Produktionsversion von v5.0, OHNE Änderung der
-validierten Handelslogik.
-
-STRATEGIELOGIK (absichtlich 1:1 wie v5.0 / Backtest):
-- EU Session: 02:00-08:30 CT, Ende exklusiv
-- US Session: 08:30-14:00 CT, Ende inklusiv
-- Pre-/Post-Session: nur Buffer, keine Signale, keine neuen Zone-Locks
-- Zone-Lock: 96 akzeptierte M5-Bars, ABER Reset bei jedem Sessionwechsel
-  (EU -> US) und beim neuen CT-Handelstag; das ist die validierte Variante.
-- System 1: Daily ATR-Momentum <= 2.5x, LONG + SHORT, CRV 1.5R
-- System 2: Daily ATR-Momentum > 2.5x, nur Trendrichtung, CRV 1.0R
-- M5 ATR Filter: Signal erlaubt solange ATR <= 0.30 (wie v5.0-Code)
-- Entry-/Stop-/Target-Berechnung inklusive Python round(..., 2) bleibt
-  absichtlich identisch zu v5.0, damit der Backtest nicht verändert wird.
-
-TECHNISCHE VERBESSERUNGEN:
-- strikte Timestamp-Verarbeitung; kein stiller Fallback auf Serverzeit
-- Duplicate- und Out-of-order-M5-Schutz
-- atomar persistierter Runtime-State (Bars, Zonen, Session, Tagesstatus)
-- persistierter Daily-Cache in demselben State
-- Daily H/L/C wird automatisch aus den eingehenden M5-Bars aufgebaut
-  (Backtest-Tag = date(America/New_York - 1h), also 01:00 ET bis 00:55 ET)
-- Input-/OHLC-Validierung
-- Thread-Lock gegen parallele Requests innerhalb eines Workers
-- Status zeigt tatsächliche Bars des CT-Tages statt globalen Barzähler
-- Signal enthält eindeutige signal_id und Bar-Timestamp
-
-WICHTIG FÜR GUNICORN/RAILWAY:
-Diese Engine verwendet absichtlich genau EINEN In-Memory-Worker, damit jede
-M5-Kerze dieselbe deterministische Zustandsmaschine durchläuft. Starte daher:
-    gunicorn cl_server_v5_1:app --workers 1 --threads 4 --timeout 30
-Für Persistenz über Railway-Redeploys STATE_FILE auf ein gemountetes Volume
-legen, z.B. /data/cl_v5_1_state.json.
-"""
-
 from __future__ import annotations
+
+"""
+CL Futures M5 | System 1 + 2 | Server v7.0 FINAL
+====================================================
+
+ZWECK
+-----
+Live-Signalserver für die neue M1-validierte Strategie.
+
+STRATEGIEPARAMETER
+------------------
+S1 (ATR-Momentum <= 2.5):
+    LONG + SHORT
+    MM=0.05, SB=0.05, CRV=0.60, LOOKBACK=20, MAX_TICKS=15
+S2 (ATR-Momentum > 2.5):
+    nur Trendrichtung
+    MM=0.08, SB=0.07, CRV=0.70, LOOKBACK=30, MAX_TICKS=18
+
+Gemeinsam:
+    M5 ATR(14) <= 0.40
+    MAX_RISK=1.00
+    MOM_THRESH=2.5
+    Daily Momentum: letzter abgeschlossener Daily-Close gegen 20 Daily-Zeilen zurück,
+                    ATR = Mittelwert H-L der letzten 14 abgeschlossenen Dailys
+    Zone-Lock: 96 akzeptierte M5-Bars, LEVEL_TOL=0.05
+    Zone-Reset: neuer CT-Handelstag + Eintritt EU + Wechsel EU->US
+    EU: 02:00 <= CT < 08:30
+    US: 08:30 <= CT <= 14:00
+    Entry/Stop/Target: Python round(..., 2), Target = Entry +/- raw_risk * CRV
+
+WICHTIG ZUR BACKTEST-GLEICHHEIT
+-------------------------------
+Der historische Referenz-Backtest, der zuletzt verwendet wurde, berechnet den
+Daily-ATR für einen Intraday-Tag aus der vollständigen H/L-Range dieses Tages.
+Das enthält Zukunftsinformation und kann live nicht 1:1 bekannt sein.
+
+Dieser Server verwendet deshalb ausschließlich ABGESCHLOSSENE Daily-Daten.
+Alle übrigen Signalregeln sind so umgesetzt, wie sie in der Referenzlogik
+definiert wurden. Vor Live-Einsatz muss der Backtest mit genau dieser kausalen
+Daily-Berechnung erneut laufen. Erst danach darf diese Datei als endgültig
+"1:1 backtest-identisch" bezeichnet werden.
+
+M1 / EXECUTION
+--------------
+Der Server erzeugt M5-Setups/Signale. Die historische M1-Regel
+"SL + TP in derselben M1-Kerze = LOSS" ist eine Backtest-Auswertungsregel und
+kann im M5-Signalserver nicht die echte Tick-Reihenfolge ersetzen.
+Der tatsächliche Order-Fill/SL/TP wird vom Ausführungs-Bridge/Broker bestimmt.
+
+TECHNIK
+-------
+- genau EIN Gunicorn-Worker verwenden
+- atomare persistente State-Datei
+- Bars, Daily-Cache, aktive Daily-Kerze, Zonen, Session, Signalhistorie,
+  Duplicate-Schutz werden persistiert
+- strikte Timestamps, kein Serverzeit-Fallback
+- Duplicate- und Out-of-order-Schutz
+- optional WEBHOOK_SECRET über Header X-Webhook-Secret
+- kann bei erstmaligem Start Daily-Historie aus einem alten State importieren:
+      LEGACY_STATE_FILE=/data/cl_state_v6.json
+- empfohlener Start:
+      gunicorn cl_server_v7:app --workers 1 --threads 4 --timeout 30
+"""
 
 from flask import Flask, request, jsonify
 from collections import deque
-from zoneinfo import ZoneInfo
 from pathlib import Path
 from threading import RLock
+from zoneinfo import ZoneInfo
 import datetime as dt
 import hashlib
 import json
 import math
 import os
+import re
 import tempfile
 import urllib.request
 
 app = Flask(__name__)
 LOCK = RLock()
 
-# ─── ENV / TIMEZONES ──────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# ENV / TIMEZONES
+# ─────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-STATE_FILE = Path(os.environ.get("STATE_FILE", "cl_v5_1_state.json"))
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+STATE_FILE = Path(os.environ.get("STATE_FILE", "/data/cl_v7_state.json"))
+LEGACY_STATE_FILE = Path(os.environ.get("LEGACY_STATE_FILE", "/data/cl_state_v6.json"))
+LEGACY_STATE_CANDIDATES = [
+    LEGACY_STATE_FILE,
+    Path("/data/cl_v6_state.json"),
+    Path("/data/cl_v5_1_state.json"),
+    Path("/data/cl_v5_state.json"),
+]
 
 CET = ZoneInfo("Europe/Berlin")
 CT = ZoneInfo("America/Chicago")
 ET = ZoneInfo("America/New_York")
 UTC = dt.timezone.utc
 
-# ─── PARAMETER: NICHT ÄNDERN OHNE NEUEN BACKTEST ─────────
-MM = 0.08
-SB = 0.05
+VERSION = "7.0"
+
+# ─────────────────────────────────────────────────────────────
+# FIXIERTE STRATEGIEPARAMETER
+# ─────────────────────────────────────────────────────────────
+S1 = {
+    "MM": 0.05,
+    "SB": 0.05,
+    "CRV": 0.60,
+    "LOOKBACK": 20,
+    "MAX_TICKS": 15,
+}
+S2 = {
+    "MM": 0.08,
+    "SB": 0.07,
+    "CRV": 0.70,
+    "LOOKBACK": 30,
+    "MAX_TICKS": 18,
+}
+
 MAX_RISK = 1.00
-MAX_TICKS = 15
-CRV_S1 = 1.5
-CRV_S2 = 1.0
-LOOKBACK = 12
-ATR_MAX = 0.30
+ATR_MAX = 0.40
 ATR_LEN = 14
 MOM_THRESH = 2.5
 MOM_WINDOW = 20
 ZONE_BARS = 96
 LEVEL_TOL = 0.05
-TICK_SIZE = 0.01
+TICK = 0.01
 
 EU_S = 2 * 60
 EU_E = 8 * 60 + 30
 US_S = 8 * 60 + 30
 US_E = 14 * 60
 
-# ─── INITIAL DAILY DATA: exakt aus v5.0 ───────────────────
-INITIAL_DAYS = [
-    {"date":"2026-07-31","h":86.87,"l":81.06,"c":86.8},
-    {"date":"2026-08-02","h":81.3,"l":78.78,"c":79.52},
-    {"date":"2026-08-03","h":81.3,"l":78.43,"c":81.23},
-    {"date":"2026-08-04","h":82.33,"l":74.24,"c":75.15},
-    {"date":"2026-08-05","h":76.7,"l":74.45,"c":74.81},
-    {"date":"2026-08-06","h":78.77,"l":74.57,"c":78.32},
-    {"date":"2026-08-07","h":78.5,"l":76.53,"c":77.08},
-    {"date":"2026-08-09","h":79.43,"l":78.18,"c":78.45},
-    {"date":"2026-08-10","h":82.52,"l":77.79,"c":82.24},
-    {"date":"2026-08-11","h":84.61,"l":81.27,"c":83.7},
-    {"date":"2026-08-12","h":84.1,"l":81.9,"c":83.0},
-    {"date":"2026-08-13","h":83.3,"l":80.09,"c":81.38},
-    {"date":"2026-08-14","h":82.99,"l":80.76,"c":82.4},
-    {"date":"2026-08-16","h":83.04,"l":81.72,"c":82.15},
-    {"date":"2026-08-17","h":85.04,"l":81.5,"c":84.34},
-    {"date":"2026-08-18","h":85.14,"l":83.78,"c":84.61},
-    {"date":"2026-08-19","h":85.84,"l":83.45,"c":84.47},
-    {"date":"2026-08-20","h":87.69,"l":84.33,"c":86.24},
-    {"date":"2026-08-21","h":87.51,"l":85.8,"c":86.64},
-    {"date":"2026-08-23","h":86.57,"l":84.84,"c":85.61},
-    {"date":"2026-08-24","h":86.24,"l":84.36,"c":85.08},
-    {"date":"2026-08-25","h":85.09,"l":80.08,"c":80.61},
-    {"date":"2026-08-26","h":83.31,"l":79.62,"c":81.83},
-    {"date":"2026-08-27","h":84.27,"l":80.65,"c":83.27},
-    {"date":"2026-08-28","h":83.71,"l":82.25,"c":83.44},
-    {"date":"2026-08-30","h":85.69,"l":84.11,"c":85.35},
-    {"date":"2026-08-31","h":87.09,"l":84.47,"c":87.0},
-    {"date":"2026-09-01","h":92.29,"l":86.22,"c":90.54},
-    {"date":"2026-09-02","h":91.48,"l":88.97,"c":90.57},
-    {"date":"2026-09-03","h":93.14,"l":89.57,"c":91.61},
-    {"date":"2026-09-04","h":91.78,"l":88.72,"c":91.22},
-]
+MAX_LOOKBACK = max(S1["LOOKBACK"], S2["LOOKBACK"])
 
-# Geschlossene Custom-Dailys seit dem letzten v5.1-Seed. Diese Werte wurden
-# aus dem TradingView-M5-Export exakt mit derselben Backtest-Gruppierung
-# date(ET - 1h) gebildet. Sie dienen nur der einmaligen Migration eines alten
-# v5.1-States; künftige Tage werden automatisch aus M5 aufgebaut.
-DAILY_MIGRATION_SEED = [
-    {"date":"2026-09-06","h":92.60,"l":91.58,"c":92.46},
-    {"date":"2026-09-07","h":93.29,"l":90.87,"c":93.06},
-]
-
-# Snapshot des aktuell laufenden Custom-Tages aus dem neuesten M5-Export
-# (2026-09-08 01:00 ET bis 04:50 ET). Bei bestehendem persistenten State wird
-# stattdessen aus den dort gespeicherten Bars rekonstruiert. Neue M5-Bars
-# aktualisieren H/L/C anschließend automatisch weiter.
-ACTIVE_DAILY_BOOTSTRAP = {
-    "date":"2026-09-08","h":94.73,"l":92.97,"c":94.51,
-    "last_ts":1788857400.0,
-}
-
-# ─── RUNTIME STATE ────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# RUNTIME STATE
+# ─────────────────────────────────────────────────────────────
 bars = deque(maxlen=600)
-days = []
-long_zones = []
+days = []                     # nur ABGESCHLOSSENE Custom-Dailys
+active_daily = None           # laufender Custom-Day
+long_zones = []               # [(level, expire_bar_num), ...]
 short_zones = []
 bar_num = 0
 bars_today = 0
 prev_session = None
-current_date = None
-sig_today = []
-wins_today = 0
-losses_today = 0
+current_ct_date = None
 last_bar_ts = None
 recent_bar_ts = deque(maxlen=2000)
-active_daily = None
+recent_bar_set = set()
+signals_today = []
+signal_history = deque(maxlen=1000)
 
 
-def _state_dict():
-    return {
-        "version": 1,
-        "bars": list(bars),
-        "days": days[-50:],
-        "long_zones": long_zones,
-        "short_zones": short_zones,
-        "bar_num": bar_num,
-        "bars_today": bars_today,
-        "prev_session": prev_session,
-        "current_date": current_date,
-        "sig_today": sig_today[-100:],
-        "wins_today": wins_today,
-        "losses_today": losses_today,
-        "last_bar_ts": last_bar_ts,
-        "recent_bar_ts": list(recent_bar_ts),
-        "active_daily": active_daily,
-    }
-
-
-def save_state():
-    """Atomic JSON replace: nie eine halb geschriebene State-Datei."""
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(_state_dict(), separators=(",", ":"), ensure_ascii=False)
-    fd, tmp_name = tempfile.mkstemp(prefix=STATE_FILE.name + ".", dir=str(STATE_FILE.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_name, STATE_FILE)
-    finally:
-        if os.path.exists(tmp_name):
-            try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
-
-
-def load_state():
-    global days, long_zones, short_zones, bar_num, bars_today
-    global prev_session, current_date, sig_today, wins_today, losses_today
-    global last_bar_ts, active_daily
-
-    if not STATE_FILE.exists():
-        days = [dict(x) for x in INITIAL_DAYS]
-        _migrate_daily_seed()
-        active_daily = dict(ACTIVE_DAILY_BOOTSTRAP)
-        save_state()
-        print(f"[STATE] neu | {len(days)} Initial-Tage")
-        return
-
-    try:
-        s = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        bars.clear()
-        bars.extend(s.get("bars", [])[-600:])
-        days = s.get("days", [])[-50:] or [dict(x) for x in INITIAL_DAYS]
-        long_zones = [tuple(x) for x in s.get("long_zones", [])]
-        short_zones = [tuple(x) for x in s.get("short_zones", [])]
-        bar_num = int(s.get("bar_num", 0))
-        bars_today = int(s.get("bars_today", 0))
-        prev_session = s.get("prev_session")
-        current_date = s.get("current_date")
-        sig_today = s.get("sig_today", [])[-100:]
-        wins_today = int(s.get("wins_today", 0))
-        losses_today = int(s.get("losses_today", 0))
-        last_bar_ts = s.get("last_bar_ts")
-        recent_bar_ts.clear()
-        recent_bar_ts.extend(s.get("recent_bar_ts", [])[-2000:])
-        active_daily = s.get("active_daily")
-        _migrate_daily_seed()
-        _rebuild_or_bootstrap_active_daily()
-        print(f"[STATE] geladen | bars={len(bars)} days={len(days)} last_ts={last_bar_ts}")
-    except Exception as e:
-        raise RuntimeError(f"State-Datei unlesbar: {STATE_FILE}: {e}") from e
-
-
-# ─── TIME / SESSION ───────────────────────────────────────
-def ct_dt(ts):
-    return dt.datetime.fromtimestamp(ts, tz=CT)
-
-
-def ct_min(ts):
-    x = ct_dt(ts)
-    return x.hour * 60 + x.minute
-
-
-def in_eu(ts):
-    return EU_S <= ct_min(ts) < EU_E
-
-
-def in_us(ts):
-    return US_S <= ct_min(ts) <= US_E
-
-
-def in_any(ts):
-    return in_eu(ts) or in_us(ts)
-
-
-def weekday(ts):
-    return ct_dt(ts).weekday() < 5
-
-
-def ct_date_str(ts):
-    return ct_dt(ts).date().isoformat()
-
-
-def session_code(ts):
-    if in_eu(ts):
-        return "EU"
-    if in_us(ts):
-        return "US"
-    return None
-
-
-def session_label(ts):
-    code = session_code(ts)
-    return "EU Session" if code == "EU" else ("US Session" if code == "US" else "")
-
-
-def parse_timestamp(value):
-    """Akzeptiert epoch sec/ms oder ISO-8601. Kein Serverzeit-Fallback."""
-    if value is None or value == "":
-        raise ValueError("timestamp 't' fehlt")
-
-    if isinstance(value, (int, float)):
-        ts = float(value)
-    else:
-        s = str(value).strip()
-        if s.replace(".", "", 1).isdigit():
-            ts = float(s)
-        else:
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            try:
-                x = dt.datetime.fromisoformat(s)
-            except ValueError as e:
-                raise ValueError(f"ungültiger ISO timestamp: {value}") from e
-            if x.tzinfo is None:
-                raise ValueError("ISO timestamp benötigt Zeitzone/Z")
-            ts = x.timestamp()
-
-    # Millisekunden erkennen
-    if ts > 10_000_000_000:
-        ts /= 1000.0
-    if not math.isfinite(ts) or ts <= 0:
-        raise ValueError("ungültiger timestamp")
-    return ts
-
-
-# ─── MARKET DATA / INDICATORS ─────────────────────────────
-def add_bar(o, h, l, c, v, ts):
-    bars.append({"o": o, "h": h, "l": l, "c": c, "v": v, "ts": ts})
-
-
-def atr_m5():
-    # exakt dieselbe TR-Logik wie v5.0
-    if len(bars) < ATR_LEN + 1:
-        return None
-    b = list(bars)
-    trs = [
-        max(
-            b[i]["h"] - b[i]["l"],
-            abs(b[i]["h"] - b[i - 1]["c"]),
-            abs(b[i]["l"] - b[i - 1]["c"]),
-        )
-        for i in range(1, len(b))
-    ]
-    return sum(trs[-ATR_LEN:]) / ATR_LEN
-
-
-def backtest_daily_date(ts):
-    """Exakte Daily-Gruppierung des Backtests: date(ET timestamp - 1h)."""
-    x = dt.datetime.fromtimestamp(float(ts), tz=ET) - dt.timedelta(hours=1)
-    return x.date().isoformat()
-
-
-def _upsert_day_no_save(row):
-    global days
-    by_date = {d["date"]: d for d in days}
-    by_date[str(row["date"])] = {
-        "date": str(row["date"]),
-        "h": float(row["h"]),
-        "l": float(row["l"]),
-        "c": float(row["c"]),
-    }
-    days = [by_date[k] for k in sorted(by_date.keys())][-50:]
-
-
-def _migrate_daily_seed():
-    """Füllt nur fehlende geschlossene Tage; überschreibt vorhandene Tage nicht."""
-    existing = {d["date"] for d in days}
-    for row in DAILY_MIGRATION_SEED:
-        if row["date"] not in existing:
-            _upsert_day_no_save(row)
-            existing.add(row["date"])
-            print(f"[DAILY-MIGRATION] {row['date']} ergänzt")
-
-
-def _aggregate_bars_for_daily(key):
-    selected = [b for b in bars if backtest_daily_date(b["ts"]) == key]
-    if not selected:
-        return None
-    selected.sort(key=lambda b: b["ts"])
-    return {
-        "date": key,
-        "h": max(float(b["h"]) for b in selected),
-        "l": min(float(b["l"]) for b in selected),
-        "c": float(selected[-1]["c"]),
-        "last_ts": float(selected[-1]["ts"]),
-    }
-
-
-def _rebuild_or_bootstrap_active_daily():
-    """Rekonstruiert den laufenden Custom-Day aus State-Bars, sonst Bootstrap."""
-    global active_daily
-    if last_bar_ts is not None:
-        key = backtest_daily_date(last_bar_ts)
-        rebuilt = _aggregate_bars_for_daily(key)
-        if rebuilt is not None:
-            # Falls derselbe Tag per Bootstrap einen früheren, vollständigeren
-            # Ausschnitt enthält, H/L zusammenführen und den neueren Close nehmen.
-            if ACTIVE_DAILY_BOOTSTRAP.get("date") == key:
-                boot = ACTIVE_DAILY_BOOTSTRAP
-                rebuilt["h"] = max(rebuilt["h"], float(boot["h"]))
-                rebuilt["l"] = min(rebuilt["l"], float(boot["l"]))
-                if float(boot.get("last_ts", 0)) > rebuilt["last_ts"]:
-                    rebuilt["c"] = float(boot["c"])
-                    rebuilt["last_ts"] = float(boot["last_ts"])
-            active_daily = rebuilt
-            return
-    if active_daily is None:
-        active_daily = dict(ACTIVE_DAILY_BOOTSTRAP)
-
-
-def update_daily_from_m5(h, l, c, ts):
-    """Baut Daily H/L/C aus JEDEM M5-Bar, auch Sonntag/Weekend.
-
-    Der vorherige Custom-Day wird beim ersten Bar mit neuem Daily-Key finalisiert.
-    Damit verwendet momentum() während eines laufenden Tages ausschließlich
-    abgeschlossene Dailys – identisch zum Backtest.
-    """
-    global active_daily
-    key = backtest_daily_date(ts)
-    h, l, c, ts = float(h), float(l), float(c), float(ts)
-
-    if active_daily is None:
-        active_daily = {"date": key, "h": h, "l": l, "c": c, "last_ts": ts}
-        return False
-
-    cur = str(active_daily["date"])
-    if key < cur:
-        # Out-of-order wird bereits im Webhook abgefangen; zusätzliche Sicherung.
-        return False
-
-    if key != cur:
-        _upsert_day_no_save(active_daily)
-        print(
-            f"[DAILY-AUTO] final {cur} "
-            f"H:{active_daily['h']} L:{active_daily['l']} C:{active_daily['c']}"
-        )
-        active_daily = {"date": key, "h": h, "l": l, "c": c, "last_ts": ts}
+# ─────────────────────────────────────────────────────────────
+# GENERIC HELPERS
+# ─────────────────────────────────────────────────────────────
+def authorized():
+    if not WEBHOOK_SECRET:
         return True
-
-    active_daily["h"] = max(float(active_daily["h"]), h)
-    active_daily["l"] = min(float(active_daily["l"]), l)
-    # Nur der zeitlich neueste Bar darf den Close setzen.
-    if ts >= float(active_daily.get("last_ts", -1)):
-        active_daily["c"] = c
-        active_daily["last_ts"] = ts
-    return False
+    return request.headers.get("X-Webhook-Secret", "") == WEBHOOK_SECRET
 
 
-def momentum():
-    # exakt wie v5.0 / Backtest
-    if len(days) < 22:
-        return None, None, False, False
-    cp = days[-1]["c"]
-    cn = days[-21]["c"]
-    atr = sum(d["h"] - d["l"] for d in days[-14:]) / 14
-    if atr <= 0:
-        return None, None, False, False
-    mom = abs(cp - cn) / atr
-    up = cp > cn
-    return mom, up, mom <= MOM_THRESH, mom > MOM_THRESH
+def r2(x):
+    # Backtest-Semantik: Python round(..., 2)
+    return round(float(x), 2)
 
 
-def add_day(date, h, l, c):
-    """Upsert nach Datum; chronologische Reihenfolge bleibt deterministisch."""
-    global days
-    row = {"date": str(date), "h": float(h), "l": float(l), "c": float(c)}
-    by_date = {d["date"]: d for d in days}
-    by_date[row["date"]] = row
-    days = [by_date[k] for k in sorted(by_date.keys())][-50:]
-    save_state()
-    print(f"[DAILY] {date} H:{h} L:{l} C:{c} | Cache={len(days)}")
-
-
-# ─── ZONE LOCK ─────────────────────────────────────────────
-def zone_tick():
-    global long_zones, short_zones
-    long_zones = [(l, e) for l, e in long_zones if e > bar_num]
-    short_zones = [(l, e) for l, e in short_zones if e > bar_num]
-
-
-def zone_locked_long(level):
-    return any(abs(l - level) <= LEVEL_TOL for l, _ in long_zones)
-
-
-def zone_locked_short(level):
-    return any(abs(l - level) <= LEVEL_TOL for l, _ in short_zones)
-
-
-def zone_add_long(level):
-    long_zones.append((level, bar_num + ZONE_BARS))
-
-
-def zone_add_short(level):
-    short_zones.append((level, bar_num + ZONE_BARS))
-
-
-def zone_reset(reason=""):
-    long_zones.clear()
-    short_zones.clear()
-    print(f"[ZONE] reset{': ' + reason if reason else ''}")
-
-
-# ─── DAY / SESSION STATE ──────────────────────────────────
-def check_new_day(ts):
-    global current_date, sig_today, wins_today, losses_today, bars_today
-    d = ct_date_str(ts)
-    if current_date is None:
-        current_date = d
-        bars_today = 0
-        return
-    if d != current_date:
-        print(f"[DAY] {current_date} -> {d}")
-        current_date = d
-        sig_today = []
-        wins_today = 0
-        losses_today = 0
-        bars_today = 0
-        zone_reset("new CT day")
-
-
-def apply_session_reset(ts):
-    """Exakt die validierte v5.0-Semantik: Reset beim Eintritt in neue Session."""
-    global prev_session
-    curr = session_code(ts)
-    if curr is not None and curr != prev_session:
-        old = prev_session
-        zone_reset(f"session {old} -> {curr}")
-        prev_session = curr
-
-
-# ─── SIGNAL ENGINE: STRATEGIE 1:1 ─────────────────────────
-def find_signals(in_session, s1, s2, up, atr):
-    if atr is None or atr > ATR_MAX:
-        return []
-    b = list(bars)
-    if len(b) < LOOKBACK + 3:
-        return []
-
-    close = b[-1]["c"]
-    sigs = []
-
-    def long_signal(system, crv):
-        for k in range(2, LOOKBACK + 1):
-            i_liq = -(k + 2)
-            i_extr = -(k + 1)
-            if abs(i_liq) > len(b):
-                break
-            liq = b[i_liq]["l"]
-            extr = b[i_extr]["l"]
-            if extr < liq and close >= liq + MM:
-                en = liq
-                st = extr - SB
-                rk = en - st
-                tk = round(rk / TICK_SIZE)  # ABSICHTLICH v5.0
-                if 0 < rk <= MAX_RISK and tk <= MAX_TICKS:
-                    if not zone_locked_long(en):
-                        if in_session:
-                            zone_add_long(en)
-                            sigs.append({
-                                "system": system,
-                                "dir": "LONG",
-                                "entry": round(en, 2),
-                                "stop": round(st, 2),
-                                "target": round(en + rk * crv, 2),
-                                "ticks": tk,
-                                "crv": crv,
-                            })
-                        break
-                    else:
-                        break
-
-    def short_signal(system, crv):
-        for k in range(2, LOOKBACK + 1):
-            i_liq = -(k + 2)
-            i_extr = -(k + 1)
-            if abs(i_liq) > len(b):
-                break
-            liq = b[i_liq]["h"]
-            extr = b[i_extr]["h"]
-            if extr > liq and close <= liq - MM:
-                en = liq
-                st = extr + SB
-                rk = st - en
-                tk = round(rk / TICK_SIZE)  # ABSICHTLICH v5.0
-                if 0 < rk <= MAX_RISK and tk <= MAX_TICKS:
-                    if not zone_locked_short(en):
-                        if in_session:
-                            zone_add_short(en)
-                            sigs.append({
-                                "system": system,
-                                "dir": "SHORT",
-                                "entry": round(en, 2),
-                                "stop": round(st, 2),
-                                "target": round(en - rk * crv, 2),
-                                "ticks": tk,
-                                "crv": crv,
-                            })
-                        break
-                    else:
-                        break
-
-    if s1:
-        long_signal("S1", CRV_S1)
-        short_signal("S1", CRV_S1)
-    if s2:
-        if up:
-            long_signal("S2", CRV_S2)
-        else:
-            short_signal("S2", CRV_S2)
-
-    return sigs
-
-
-# ─── TELEGRAM ──────────────────────────────────────────────
-def tg(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[TG OFF] {msg[:100]}")
-        return False
-    try:
-        body = json.dumps({
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg,
-            "parse_mode": "HTML",
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data=body,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status == 200
-    except Exception as e:
-        print(f"[TG ERR] {e}")
-        return False
-
-
-def signal_id(ts, sig):
-    raw = f"{int(ts)}|{sig['system']}|{sig['dir']}|{sig['entry']:.2f}|{sig['stop']:.2f}|{sig['target']:.2f}"
-    return hashlib.sha1(raw.encode()).hexdigest()[:12]
-
-
-def fmt(sig, mom, atr, sess, ts):
-    local = dt.datetime.fromtimestamp(ts, tz=CET)
-    em = "🟢" if sig["dir"] == "LONG" else "🔴"
-    ar = "▲" if sig["dir"] == "LONG" else "▼"
-    risk = sig["ticks"] * 10
-    rew = round(sig["ticks"] * sig["crv"] * 10)
-    rewt = round(sig["ticks"] * sig["crv"])
-    name = "1 (Seitwärts)" if sig["system"] == "S1" else "2 (Trend)"
-    sid = signal_id(ts, sig)
-    return (
-        f"{em} <b>System {name} | {sig['dir']} {ar}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📍 Entry:  <b>${sig['entry']:.2f}</b>\n"
-        f"🛑 Stop:   <b>${sig['stop']:.2f}</b>  (-{sig['ticks']}T / -${risk})\n"
-        f"🎯 Target: <b>${sig['target']:.2f}</b>  (+{rewt}T / +${rew})\n"
-        f"📊 CRV 1:{sig['crv']} | ATR-Mom:{mom:.1f}× | ATR:${atr:.3f}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 {local.strftime('%Y-%m-%d %H:%M %Z')} | {sess} | CL M5\n"
-        f"ID: <code>{sid}</code>"
-    )
-
-
-# ─── REQUEST HELPERS ───────────────────────────────────────
 def parse_json_body():
     raw = request.get_data(as_text=True)
     if not raw or not raw.strip():
@@ -653,8 +176,6 @@ def parse_json_body():
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Kompatibilität zum alten TradingView-Format mit unquoted ISO-Zeit
-        import re
         fixed = re.sub(
             r'"t":([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+-]+Z?)',
             r'"t":"\1"',
@@ -674,8 +195,37 @@ def get_price(d, short_key, long_key):
     raise ValueError(f"Feld '{short_key}'/'{long_key}' fehlt")
 
 
-def validate_ohlc(o, h, l, c, v):
-    vals = [o, h, l, c, v]
+def parse_timestamp(value):
+    """Epoch sec/ms oder ISO-8601 mit Zeitzone. Kein Serverzeit-Fallback."""
+    if value is None or value == "":
+        raise ValueError("timestamp 't' fehlt")
+
+    if isinstance(value, (int, float)):
+        ts = float(value)
+    else:
+        s = str(value).strip()
+        try:
+            ts = float(s)
+        except ValueError:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            try:
+                x = dt.datetime.fromisoformat(s)
+            except ValueError as e:
+                raise ValueError(f"ungültiger ISO timestamp: {value}") from e
+            if x.tzinfo is None:
+                raise ValueError("ISO timestamp benötigt Zeitzone/Z")
+            ts = x.timestamp()
+
+    if ts > 10_000_000_000:
+        ts /= 1000.0
+    if not math.isfinite(ts) or ts <= 0:
+        raise ValueError("ungültiger timestamp")
+    return ts
+
+
+def validate_ohlcv(o, h, l, c, v):
+    vals = (o, h, l, c, v)
     if not all(math.isfinite(x) for x in vals):
         raise ValueError("OHLCV enthält NaN/Inf")
     if min(o, h, l, c) <= 0:
@@ -686,25 +236,552 @@ def validate_ohlc(o, h, l, c, v):
         raise ValueError("volume < 0")
 
 
-# ─── ENDPOINTS ─────────────────────────────────────────────
+def remember_ts(ts):
+    key = int(round(float(ts)))
+    if key in recent_bar_set:
+        return False
+    if len(recent_bar_ts) == recent_bar_ts.maxlen:
+        old = recent_bar_ts[0]
+        recent_bar_set.discard(old)
+    recent_bar_ts.append(key)
+    recent_bar_set.add(key)
+    return True
+
+
+# ─────────────────────────────────────────────────────────────
+# TIME / SESSION
+# ─────────────────────────────────────────────────────────────
+def ct_dt(ts):
+    return dt.datetime.fromtimestamp(float(ts), tz=CT)
+
+
+def ct_min(ts):
+    x = ct_dt(ts)
+    return x.hour * 60 + x.minute
+
+
+def ct_date_str(ts):
+    return ct_dt(ts).date().isoformat()
+
+
+def weekday_ct(ts):
+    return ct_dt(ts).weekday() < 5
+
+
+def in_eu(ts):
+    return EU_S <= ct_min(ts) < EU_E
+
+
+def in_us(ts):
+    # Referenz-Backtest: 14:00 eingeschlossen.
+    return US_S <= ct_min(ts) <= US_E
+
+
+def session_code(ts):
+    if in_eu(ts):
+        return "EU"
+    if in_us(ts):
+        return "US"
+    return None
+
+
+def session_label(ts):
+    s = session_code(ts)
+    return "EU Session" if s == "EU" else ("US Session" if s == "US" else "")
+
+
+def in_any_session(ts):
+    return session_code(ts) is not None
+
+
+# ─────────────────────────────────────────────────────────────
+# PERSISTENCE
+# ─────────────────────────────────────────────────────────────
+def state_dict():
+    return {
+        "version": VERSION,
+        "bars": list(bars),
+        "days": days[-80:],
+        "active_daily": active_daily,
+        "long_zones": long_zones,
+        "short_zones": short_zones,
+        "bar_num": bar_num,
+        "bars_today": bars_today,
+        "prev_session": prev_session,
+        "current_ct_date": current_ct_date,
+        "last_bar_ts": last_bar_ts,
+        "recent_bar_ts": list(recent_bar_ts),
+        "signals_today": signals_today[-200:],
+        "signal_history": list(signal_history),
+    }
+
+
+def save_state():
+    """Atomisches JSON-Replace."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(state_dict(), separators=(",", ":"), ensure_ascii=False)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=STATE_FILE.name + ".",
+        dir=str(STATE_FILE.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, STATE_FILE)
+    finally:
+        if os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
+def import_legacy_days():
+    """Nur Daily-Historie migrieren; KEINE alten Zonen/Bars/Signale."""
+    source = next((p for p in LEGACY_STATE_CANDIDATES if p.exists()), None)
+    if source is None:
+        return []
+    try:
+        s = json.loads(source.read_text(encoding="utf-8"))
+        raw = s.get("days", [])
+        clean = []
+        for d in raw:
+            date = str(d["date"])
+            dt.date.fromisoformat(date)
+            h, l, c = float(d["h"]), float(d["l"]), float(d["c"])
+            if not all(math.isfinite(x) for x in (h, l, c)):
+                continue
+            if l <= 0 or h < l or not (l <= c <= h):
+                continue
+            clean.append({"date": date, "h": h, "l": l, "c": c})
+        by_date = {d["date"]: d for d in clean}
+        out = [by_date[k] for k in sorted(by_date.keys())][-80:]
+        if out:
+            print(f"[MIGRATION] {len(out)} Daily-Zeilen aus {source}")
+        return out
+    except Exception as e:
+        print(f"[MIGRATION ERR] {e}")
+        return []
+
+
+def load_state():
+    global days, active_daily, long_zones, short_zones
+    global bar_num, bars_today, prev_session, current_ct_date
+    global last_bar_ts, signals_today
+
+    if not STATE_FILE.exists():
+        days = import_legacy_days()
+        save_state()
+        print(f"[STATE] neu | days={len(days)}")
+        return
+
+    try:
+        s = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+
+        bars.clear()
+        bars.extend(s.get("bars", [])[-600:])
+
+        raw_days = s.get("days", [])
+        days = raw_days[-80:] if raw_days else import_legacy_days()
+        active_daily = s.get("active_daily")
+
+        long_zones = [tuple(x) for x in s.get("long_zones", [])]
+        short_zones = [tuple(x) for x in s.get("short_zones", [])]
+
+        bar_num = int(s.get("bar_num", 0))
+        bars_today = int(s.get("bars_today", 0))
+        prev_session = s.get("prev_session")
+        current_ct_date = s.get("current_ct_date")
+        last_bar_ts = s.get("last_bar_ts")
+        signals_today = s.get("signals_today", [])[-200:]
+
+        recent_bar_ts.clear()
+        recent_bar_set.clear()
+        for x in s.get("recent_bar_ts", [])[-2000:]:
+            k = int(x)
+            recent_bar_ts.append(k)
+            recent_bar_set.add(k)
+
+        signal_history.clear()
+        signal_history.extend(s.get("signal_history", [])[-1000:])
+
+        print(
+            f"[STATE] geladen bars={len(bars)} days={len(days)} "
+            f"zones={len(long_zones)}/{len(short_zones)} last_ts={last_bar_ts}"
+        )
+    except Exception as e:
+        raise RuntimeError(f"State-Datei unlesbar: {STATE_FILE}: {e}") from e
+
+
+# ─────────────────────────────────────────────────────────────
+# DAILY DATA / MOMENTUM
+# ─────────────────────────────────────────────────────────────
+def backtest_daily_date(ts):
+    """
+    Custom-Day-Gruppierung aus dem bisherigen robusten Server:
+    date(America/New_York timestamp - 1h).
+    """
+    x = dt.datetime.fromtimestamp(float(ts), tz=ET) - dt.timedelta(hours=1)
+    return x.date().isoformat()
+
+
+def upsert_closed_day(row):
+    global days
+    date = str(row["date"])
+    clean = {
+        "date": date,
+        "h": float(row["h"]),
+        "l": float(row["l"]),
+        "c": float(row["c"]),
+    }
+    by_date = {d["date"]: d for d in days}
+    by_date[date] = clean
+    days = [by_date[k] for k in sorted(by_date.keys())][-80:]
+
+
+def update_daily_from_m5(h, l, c, ts):
+    """
+    Baut den laufenden Custom-Day aus allen eingehenden M5-Bars.
+    Erst beim Wechsel des Daily-Keys wird der vorherige Tag in `days`
+    übernommen. Momentum nutzt damit nur abgeschlossene Tage.
+    """
+    global active_daily
+
+    key = backtest_daily_date(ts)
+    h, l, c, ts = float(h), float(l), float(c), float(ts)
+
+    if active_daily is None:
+        active_daily = {
+            "date": key, "h": h, "l": l, "c": c, "last_ts": ts
+        }
+        return False
+
+    cur = str(active_daily["date"])
+    if key < cur:
+        return False
+
+    if key != cur:
+        upsert_closed_day(active_daily)
+        print(
+            f"[DAILY] final {cur} "
+            f"H:{active_daily['h']:.2f} L:{active_daily['l']:.2f} "
+            f"C:{active_daily['c']:.2f}"
+        )
+        active_daily = {
+            "date": key, "h": h, "l": l, "c": c, "last_ts": ts
+        }
+        return True
+
+    active_daily["h"] = max(float(active_daily["h"]), h)
+    active_daily["l"] = min(float(active_daily["l"]), l)
+    if ts >= float(active_daily.get("last_ts", -1)):
+        active_daily["c"] = c
+        active_daily["last_ts"] = ts
+    return False
+
+
+def momentum():
+    """
+    Live-kausale Fassung:
+    cp = letzter abgeschlossener Daily-Close
+    cn = 20 Daily-Zeilen davor (days[-21])
+    ATR = Mittel H-L der letzten 14 abgeschlossenen Dailys
+    """
+    if len(days) < 21:
+        return None, None, False, False
+
+    cp = float(days[-1]["c"])
+    cn = float(days[-21]["c"])
+    atr_d = sum(float(d["h"]) - float(d["l"]) for d in days[-14:]) / 14.0
+
+    if atr_d <= 0:
+        return None, None, False, False
+
+    mom = abs(cp - cn) / atr_d
+    up = cp > cn
+    return mom, up, mom <= MOM_THRESH, mom > MOM_THRESH
+
+
+# ─────────────────────────────────────────────────────────────
+# M5 ATR
+# ─────────────────────────────────────────────────────────────
+def add_bar(o, h, l, c, v, ts):
+    bars.append({
+        "o": float(o), "h": float(h), "l": float(l),
+        "c": float(c), "v": float(v), "ts": float(ts)
+    })
+
+
+def atr_m5():
+    if len(bars) < ATR_LEN + 1:
+        return None
+
+    b = list(bars)
+    trs = []
+    for i in range(1, len(b)):
+        trs.append(max(
+            b[i]["h"] - b[i]["l"],
+            abs(b[i]["h"] - b[i - 1]["c"]),
+            abs(b[i]["l"] - b[i - 1]["c"]),
+        ))
+    return sum(trs[-ATR_LEN:]) / ATR_LEN
+
+
+# ─────────────────────────────────────────────────────────────
+# ZONE LOCK / SESSION RESET
+# ─────────────────────────────────────────────────────────────
+def zone_tick():
+    global long_zones, short_zones
+    long_zones = [(lv, ex) for lv, ex in long_zones if ex > bar_num]
+    short_zones = [(lv, ex) for lv, ex in short_zones if ex > bar_num]
+
+
+def zone_locked(zones, level):
+    return any(abs(float(lv) - float(level)) <= LEVEL_TOL for lv, _ in zones)
+
+
+def zone_add(zones, level):
+    zones.append((float(level), bar_num + ZONE_BARS))
+
+
+def zone_reset(reason=""):
+    long_zones.clear()
+    short_zones.clear()
+    print(f"[ZONE] reset{': ' + reason if reason else ''}")
+
+
+def check_new_ct_day(ts):
+    global current_ct_date, bars_today, signals_today, prev_session
+
+    d = ct_date_str(ts)
+    if current_ct_date is None:
+        current_ct_date = d
+        bars_today = 0
+        return
+
+    if d != current_ct_date:
+        print(f"[DAY] {current_ct_date} -> {d}")
+        current_ct_date = d
+        bars_today = 0
+        signals_today = []
+        zone_reset("new CT day")
+        # Wichtig: Damit der erste Eintritt in EU des neuen Tages
+        # sicher wieder als Sessionwechsel erkannt wird.
+        prev_session = None
+
+
+def apply_session_reset(ts):
+    """
+    Reset beim EINTRITT in EU und beim Wechsel EU -> US.
+    Außerhalb einer Session bleibt prev_session unverändert.
+    """
+    global prev_session
+
+    curr = session_code(ts)
+    if curr is not None and curr != prev_session:
+        old = prev_session
+        zone_reset(f"session {old} -> {curr}")
+        prev_session = curr
+
+
+# ─────────────────────────────────────────────────────────────
+# SIGNAL ENGINE
+# ─────────────────────────────────────────────────────────────
+def make_signal(system, direction, params, entry, stop):
+    risk = (entry - stop) if direction == "LONG" else (stop - entry)
+    ticks = round(risk / TICK)
+
+    if not (0 < risk <= MAX_RISK and ticks <= params["MAX_TICKS"]):
+        return None
+
+    target = (
+        entry + risk * params["CRV"]
+        if direction == "LONG"
+        else entry - risk * params["CRV"]
+    )
+
+    return {
+        "system": system,
+        "dir": direction,
+        "entry": r2(entry),
+        "stop": r2(stop),
+        "target": r2(target),
+        "raw_risk": float(risk),
+        "ticks": int(ticks),
+        "crv": float(params["CRV"]),
+        "mm": float(params["MM"]),
+        "sb": float(params["SB"]),
+        "lookback": int(params["LOOKBACK"]),
+        "max_ticks": int(params["MAX_TICKS"]),
+    }
+
+
+def scan_direction(system, direction, params, close):
+    """
+    Referenz-Semantik:
+    - k = 2..LOOKBACK
+    - erstes Sweep/Reclaim-Muster besitzt den Scan
+    - sobald die Pattern-Bedingung erfüllt ist, wird IMMER abgebrochen,
+      auch wenn Risk/MaxTicks ungültig oder das Level gesperrt ist.
+    """
+    b = list(bars)
+    zones = long_zones if direction == "LONG" else short_zones
+
+    for k in range(2, params["LOOKBACK"] + 1):
+        i_liq = -(k + 2)
+        i_extr = -(k + 1)
+
+        if abs(i_liq) > len(b):
+            break
+
+        if direction == "LONG":
+            liq = float(b[i_liq]["l"])
+            extr = float(b[i_extr]["l"])
+            pattern = extr < liq and close >= liq + params["MM"]
+            stop = extr - params["SB"]
+        else:
+            liq = float(b[i_liq]["h"])
+            extr = float(b[i_extr]["h"])
+            pattern = extr > liq and close <= liq - params["MM"]
+            stop = extr + params["SB"]
+
+        if not pattern:
+            continue
+
+        sig = make_signal(system, direction, params, liq, stop)
+
+        if sig is not None and not zone_locked(zones, liq):
+            zone_add(zones, liq)
+            return sig
+
+        # Entscheidend: erstes qualifying Pattern beendet den Scan.
+        break
+
+    return None
+
+
+def find_signals(s1_active, s2_active, trend_up, atr):
+    if atr is None or atr > ATR_MAX:
+        return []
+
+    b = list(bars)
+    if len(b) < MAX_LOOKBACK + 3:
+        return []
+
+    close = float(b[-1]["c"])
+    out = []
+
+    if s1_active:
+        a = scan_direction("S1", "LONG", S1, close)
+        b_sig = scan_direction("S1", "SHORT", S1, close)
+        if a:
+            out.append(a)
+        if b_sig:
+            out.append(b_sig)
+
+    if s2_active:
+        direction = "LONG" if trend_up else "SHORT"
+        s = scan_direction("S2", direction, S2, close)
+        if s:
+            out.append(s)
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────────────────────────
+def tg(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"[TG OFF] {msg[:200]}")
+        return False
+
+    try:
+        body = json.dumps({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML",
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status == 200
+    except Exception as e:
+        print(f"[TG ERR] {e}")
+        return False
+
+
+def signal_id(ts, sig):
+    raw = (
+        f"{int(ts)}|{sig['system']}|{sig['dir']}|"
+        f"{sig['entry']:.2f}|{sig['stop']:.2f}|{sig['target']:.2f}"
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def format_signal(sig, mom, atr, sess, ts):
+    local = dt.datetime.fromtimestamp(ts, tz=CET)
+    em = "🟢" if sig["dir"] == "LONG" else "🔴"
+    ar = "▲" if sig["dir"] == "LONG" else "▼"
+    name = "1 (Seitwärts)" if sig["system"] == "S1" else "2 (Trend)"
+
+    risk_dollars = sig["ticks"] * 10
+    reward_ticks = abs(sig["target"] - sig["entry"]) / TICK
+    reward_dollars = round(reward_ticks * 10)
+    sid = signal_id(ts, sig)
+
+    return (
+        f"{em} <b>System {name} | {sig['dir']} {ar}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📍 Entry:  <b>${sig['entry']:.2f}</b>\n"
+        f"🛑 Stop:   <b>${sig['stop']:.2f}</b>  "
+        f"(-{sig['ticks']}T / -${risk_dollars})\n"
+        f"🎯 Target: <b>${sig['target']:.2f}</b>  "
+        f"(+{reward_ticks:.0f}T / +${reward_dollars})\n"
+        f"📊 CRV 1:{sig['crv']:.1f} | ATR-Mom:{mom:.1f}× | ATR:${atr:.3f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 {local.strftime('%Y-%m-%d %H:%M %Z')} | {sess} | CL M5\n"
+        f"ID: <code>{sid}</code>"
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# ENDPOINTS
+# ─────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global bar_num, bars_today, last_bar_ts
 
     with LOCK:
         try:
+            if not authorized():
+                return jsonify({"status": "error", "msg": "unauthorized"}), 401
+
             d = parse_json_body()
             o = get_price(d, "o", "open")
             h = get_price(d, "h", "high")
             l = get_price(d, "l", "low")
             c = get_price(d, "c", "close")
-            v = float(d.get("v", d.get("volume", 0)))
-            ts = parse_timestamp(d.get("t"))
-            validate_ohlc(o, h, l, c, v)
+            v = float(d.get("v", d.get("volume", 0)) or 0)
+            ts = parse_timestamp(d.get("t", d.get("time")))
+
+            validate_ohlcv(o, h, l, c, v)
 
             ts_key = int(round(ts))
-            if ts_key in recent_bar_ts:
-                return jsonify({"status": "ok", "msg": "duplicate bar ignored", "ts": ts_key}), 200
+            if ts_key in recent_bar_set:
+                return jsonify({
+                    "status": "ok",
+                    "msg": "duplicate bar ignored",
+                    "ts": ts_key,
+                }), 200
+
             if last_bar_ts is not None and ts <= float(last_bar_ts):
                 return jsonify({
                     "status": "ok",
@@ -713,236 +790,242 @@ def webhook():
                     "last_bar_ts": last_bar_ts,
                 }), 200
 
-            # Daily-Aggregation läuft ausnahmslos für jeden M5-Bar, inklusive
-            # Sonntag. Das ist für die Backtest-Daily-Gruppierung erforderlich.
+            # Daily-Aufbau bekommt ALLE M5-Bars, auch Weekend/Sonntag.
             update_daily_from_m5(h, l, c, ts)
 
-            if not weekday(ts):
-                recent_bar_ts.append(ts_key)
-                last_bar_ts = ts
+            if not remember_ts(ts):
+                return jsonify({
+                    "status": "ok",
+                    "msg": "duplicate bar ignored",
+                    "ts": ts_key,
+                }), 200
+
+            last_bar_ts = ts
+
+            # Signal-M5-Puffer wie bisher nur CT-Wochentage.
+            if not weekday_ct(ts):
                 save_state()
-                return jsonify({"status": "ok", "msg": "weekend daily-only", "daily_key": backtest_daily_date(ts)}), 200
+                return jsonify({
+                    "status": "ok",
+                    "msg": "weekend daily-only",
+                    "daily_key": backtest_daily_date(ts),
+                }), 200
 
-            check_new_day(ts)
+            check_new_ct_day(ts)
 
-            # Exakt wie Backtest: jede akzeptierte M5-Kerze geht in den Buffer
             add_bar(o, h, l, c, v, ts)
             bar_num += 1
             bars_today += 1
-            zone_tick()
 
-            # Validierte Session-Reset-Regel
+            zone_tick()
             apply_session_reset(ts)
 
-            recent_bar_ts.append(ts_key)
-            last_bar_ts = ts
-
-            mom, up, s1, s2 = momentum()
+            mom, up, s1_active, s2_active = momentum()
             atr = atr_m5()
             sess = session_label(ts)
-            in_session = in_any(ts)
 
             if mom is None:
                 save_state()
-                return jsonify({"status":"ok", "msg":f"warming up ({len(days)} days)"}), 200
-            if atr is None:
-                save_state()
-                return jsonify({"status":"ok", "msg":"atr warming up"}), 200
-            if not in_session:
-                save_state()
                 return jsonify({
-                    "status":"ok",
-                    "msg":"pre-session buffer only",
-                    "mom_atr":round(mom,2),
-                    "atr_m5":round(atr,3),
+                    "status": "ok",
+                    "msg": f"daily warming up ({len(days)} closed days)",
                 }), 200
 
-            signals = find_signals(True, s1, s2, up, atr)
+            if atr is None:
+                save_state()
+                return jsonify({
+                    "status": "ok",
+                    "msg": "M5 ATR warming up",
+                }), 200
+
+            if not in_any_session(ts):
+                save_state()
+                return jsonify({
+                    "status": "ok",
+                    "msg": "pre/post-session buffer only",
+                    "mom_atr": round(mom, 4),
+                    "atr_m5": round(atr, 4),
+                }), 200
+
+            signals = find_signals(s1_active, s2_active, up, atr)
             sent = []
+
             for sig in signals:
                 sid = signal_id(ts, sig)
-                tg_ok = tg(fmt(sig, mom, atr, sess, ts))
+                telegram_ok = tg(format_signal(sig, mom, atr, sess, ts))
+
                 record = {
                     "signal_id": sid,
                     "bar_ts": int(ts),
-                    "time": dt.datetime.fromtimestamp(ts, tz=CET).isoformat(),
+                    "time_berlin": dt.datetime.fromtimestamp(ts, tz=CET).isoformat(),
+                    "time_ct": dt.datetime.fromtimestamp(ts, tz=CT).isoformat(),
                     "system": sig["system"],
                     "dir": sig["dir"],
                     "entry": sig["entry"],
                     "stop": sig["stop"],
                     "target": sig["target"],
+                    "raw_risk": sig["raw_risk"],
                     "ticks": sig["ticks"],
+                    "crv": sig["crv"],
                     "session": sess,
-                    "telegram_sent": tg_ok,
+                    "mom_atr": mom,
+                    "atr_m5": atr,
+                    "telegram_sent": telegram_ok,
                 }
-                sig_today.append(record)
+
+                signals_today.append(record)
+                signal_history.append(record)
                 sent.append(record)
-                print(f"[SIG] {sid} | {sess} | {sig['system']} {sig['dir']} @{sig['entry']}")
+
+                print(
+                    f"[SIG] {sid} | {sess} | "
+                    f"{sig['system']} {sig['dir']} @{sig['entry']:.2f}"
+                )
 
             save_state()
+
             return jsonify({
-                "status":"ok",
-                "version":"5.1.1",
-                "bar_ts":int(ts),
-                "session":sess,
-                "mom_atr":round(mom,2),
-                "atr_m5":round(atr,3),
-                "s1":s1,
-                "s2":s2,
-                "trend_up":up,
-                "signals":sent,
-                "zone_lock":{
-                    "long":[round(lv,2) for lv,_ in long_zones],
-                    "short":[round(lv,2) for lv,_ in short_zones],
+                "status": "ok",
+                "version": VERSION,
+                "bar_ts": int(ts),
+                "session": sess,
+                "mom_atr": round(mom, 4),
+                "atr_m5": round(atr, 4),
+                "system": "S1" if s1_active else "S2",
+                "trend": "up" if up else "down",
+                "signals": sent,
+                "zone_lock": {
+                    "long": [
+                        {"level": round(lv, 2), "expire_bar": ex}
+                        for lv, ex in long_zones
+                    ],
+                    "short": [
+                        {"level": round(lv, 2), "expire_bar": ex}
+                        for lv, ex in short_zones
+                    ],
                 },
             }), 200
 
         except ValueError as e:
-            return jsonify({"status":"error", "msg":str(e)}), 400
+            return jsonify({"status": "error", "msg": str(e)}), 400
         except Exception as e:
             print(f"[ERR] {type(e).__name__}: {e}")
-            return jsonify({"status":"error", "msg":str(e)}), 500
+            return jsonify({"status": "error", "msg": str(e)}), 500
 
 
 @app.route("/daily", methods=["POST"])
-def daily_endpoint():
-    # Seit v5.1.1 wird Daily exakt aus M5 aufgebaut. Einen nativen TradingView-D1
-    # hier einzuspeisen würde die Backtest-Gruppierung überschreiben.
+def daily_disabled():
+    # Daily wird aus M5 gebaut, damit die Gruppierung deterministisch bleibt.
     return jsonify({
-        "status":"disabled",
-        "msg":"Daily wird automatisch aus M5 aufgebaut; D1-Alarm deaktiviert lassen.",
+        "status": "disabled",
+        "msg": "Daily wird automatisch aus M5 aufgebaut; D1-Alarm deaktiviert lassen.",
     }), 409
-
-
-def _legacy_daily_endpoint_disabled():
-    with LOCK:
-        try:
-            d = parse_json_body()
-            h = float(d["h"])
-            l = float(d["l"])
-            c = float(d["c"])
-            if not all(math.isfinite(x) for x in (h, l, c)) or l <= 0 or h < l or c < l or c > h:
-                raise ValueError("ungültige Daily H/L/C")
-            date = d.get("date")
-            if not date:
-                raise ValueError("daily 'date' fehlt")
-            # Formatprüfung
-            dt.date.fromisoformat(str(date))
-
-            add_day(str(date), h, l, c)
-            mom, up, s1, s2 = momentum()
-            if mom is not None:
-                tg(
-                    f"📅 <b>Tagesabschluss {date}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"💰 Close: <b>${c:.2f}</b>\n"
-                    f"📊 ATR-Mom: {mom:.2f}×\n"
-                    f"{'✅ Morgen: System 1 (Seitwärts)' if s1 else '📈 Morgen: System 2 (Trend)'}\n"
-                    f"Trend: {'📈 UP' if up else '📉 DOWN'}"
-                )
-
-            return jsonify({
-                "status":"ok",
-                "date":str(date),
-                "mom_atr":round(mom,2) if mom is not None else None,
-                "system":"S1" if s1 else "S2",
-                "trend":"up" if up else "down",
-                "days_cached":len(days),
-            }), 200
-        except (ValueError, KeyError) as e:
-            return jsonify({"status":"error", "msg":str(e)}), 400
-        except Exception as e:
-            return jsonify({"status":"error", "msg":str(e)}), 500
-
-
-@app.route("/outcome/<result>", methods=["POST"])
-def outcome(result):
-    global wins_today, losses_today
-    with LOCK:
-        if result not in {"win", "loss"}:
-            return jsonify({"status":"error", "msg":"result must be win/loss"}), 400
-        if result == "win":
-            wins_today += 1
-            em = "✅"
-        else:
-            losses_today += 1
-            em = "❌"
-        total = wins_today + losses_today
-        tq = wins_today / total * 100 if total else 0
-        now = dt.datetime.now(CET)
-        tg(
-            f"{em} <b>Trade {result.upper()}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Heute: {wins_today}W / {losses_today}L ({tq:.0f}% TQ)\n"
-            f"🕐 {now.strftime('%H:%M %Z')}"
-        )
-        save_state()
-        return jsonify({"status":"ok", "tq":round(tq,1)}), 200
 
 
 @app.route("/status", methods=["GET"])
 def status():
     with LOCK:
-        mom, up, s1, s2 = momentum()
-        total = wins_today + losses_today
-        tq = wins_today / total * 100 if total else 0
+        mom, up, s1_active, s2_active = momentum()
         now = dt.datetime.now(CET)
+
         return jsonify({
-            "status":"online",
-            "version":"5.1.1",
-            "time_local":now.isoformat(),
-            "trade_date_ct":current_date,
-            "sessions_ct":{"eu":"02:00-08:30", "us":"08:30-14:00"},
-            "zone_reset":"new CT day + every session transition",
-            "daily_cache":{
-                "days":len(days),
-                "last_day":days[-1]["date"] if days else None,
-                "last_close":days[-1]["c"] if days else None,
-                "mom_atr":round(mom,2) if mom is not None else None,
-                "s1":s1,
-                "s2":s2,
-                "trend_up":up,
-                "source":"auto_from_m5",
-                "active_day":active_daily.get("date") if active_daily else None,
-                "active_h":round(float(active_daily["h"]),2) if active_daily else None,
-                "active_l":round(float(active_daily["l"]),2) if active_daily else None,
-                "active_c":round(float(active_daily["c"]),2) if active_daily else None,
+            "status": "online",
+            "version": VERSION,
+            "time_berlin": now.isoformat(),
+            "state_file": str(STATE_FILE),
+            "legacy_state_file": str(LEGACY_STATE_FILE),
+            "strategy": {
+                "S1": S1,
+                "S2": S2,
+                "atr_max": ATR_MAX,
+                "atr_len": ATR_LEN,
+                "mom_thresh": MOM_THRESH,
+                "mom_window": MOM_WINDOW,
+                "zone_bars": ZONE_BARS,
+                "level_tol": LEVEL_TOL,
+                "sessions_ct": {
+                    "eu": "02:00 <= t < 08:30",
+                    "us": "08:30 <= t <= 14:00",
+                },
+                "zone_reset": "new CT day + EU entry + EU->US",
+                "target_formula": "round(entry +/- raw_risk*crv, 2)",
+                "daily_mode": "closed-days-only (live causal)",
             },
-            "atr_filter":f"<= {ATR_MAX}$ (v5.0 semantics)",
-            "bars_today":bars_today,
-            "bars_buffer":len(bars),
-            "last_bar_ts":last_bar_ts,
-            "last_bar_utc":dt.datetime.fromtimestamp(last_bar_ts, tz=UTC).isoformat() if last_bar_ts else None,
-            "zone_lock":{
-                "long":[round(lv,2) for lv,_ in long_zones],
-                "short":[round(lv,2) for lv,_ in short_zones],
+            "runtime": {
+                "current_ct_date": current_ct_date,
+                "bars_today": bars_today,
+                "bars_buffer": len(bars),
+                "bar_num": bar_num,
+                "last_bar_ts": last_bar_ts,
+                "last_bar_utc": (
+                    dt.datetime.fromtimestamp(last_bar_ts, tz=UTC).isoformat()
+                    if last_bar_ts else None
+                ),
+                "prev_session": prev_session,
             },
-            "today":{
-                "signals":len(sig_today),
-                "wins":wins_today,
-                "losses":losses_today,
-                "tq_pct":round(tq,1),
+            "daily": {
+                "closed_days": len(days),
+                "last_closed_day": days[-1]["date"] if days else None,
+                "active_day": active_daily,
+                "mom_atr": round(mom, 4) if mom is not None else None,
+                "system": (
+                    "S1" if s1_active else ("S2" if s2_active else None)
+                ),
+                "trend": (
+                    "up" if up is True else ("down" if up is False else None)
+                ),
             },
-            "signals_today":sig_today[-10:],
-            "state_file":str(STATE_FILE),
+            "zones": {
+                "long": [
+                    {"level": round(lv, 2), "expire_bar": ex}
+                    for lv, ex in long_zones
+                ],
+                "short": [
+                    {"level": round(lv, 2), "expire_bar": ex}
+                    for lv, ex in short_zones
+                ],
+            },
+            "signals_today": signals_today[-20:],
         }), 200
 
 
-@app.route("/reset", methods=["GET", "POST"])
-def reset_endpoint():
-    global sig_today, wins_today, losses_today
+@app.route("/reset", methods=["POST"])
+def reset():
+    global signals_today, prev_session
+
     with LOCK:
-        sig_today = []
-        wins_today = 0
-        losses_today = 0
+        if not authorized():
+            return jsonify({"status": "error", "msg": "unauthorized"}), 401
+
+        signals_today = []
         zone_reset("manual")
+        # Session-State bewusst nicht auf None setzen:
+        # ein manueller Reset innerhalb der laufenden Session soll nicht
+        # beim nächsten M5-Bar nochmals automatisch resetten.
         save_state()
-        return jsonify({"status":"ok", "msg":"day stats + zones reset"}), 200
+
+        return jsonify({
+            "status": "ok",
+            "msg": "signal day stats + zones reset",
+        }), 200
+
+
+@app.route("/test", methods=["GET"])
+def test():
+    ok = tg(
+        "🧪 <b>CL v7.0 FINAL</b> — Server online\n"
+        "S1 0.6R | S2 0.7R | EU + US"
+    )
+    return jsonify({"status": "ok", "telegram": bool(ok)}), 200
 
 
 @app.route("/health", methods=["GET"])
+@app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status":"ok", "version":"5.1.1"}), 200
+    return jsonify({
+        "status": "online",
+        "version": VERSION,
+    }), 200
 
 
 load_state()
