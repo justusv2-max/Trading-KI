@@ -69,6 +69,7 @@ from pathlib import Path
 from threading import RLock
 from zoneinfo import ZoneInfo
 import datetime as dt
+import hmac
 import hashlib
 import json
 import math
@@ -100,7 +101,7 @@ CT = ZoneInfo("America/Chicago")
 ET = ZoneInfo("America/New_York")
 UTC = dt.timezone.utc
 
-VERSION = "7.0"
+VERSION = "7.0.2"
 
 # ─────────────────────────────────────────────────────────────
 # FIXIERTE STRATEGIEPARAMETER
@@ -167,10 +168,21 @@ signal_history = deque(maxlen=1000)
 # ─────────────────────────────────────────────────────────────
 # GENERIC HELPERS
 # ─────────────────────────────────────────────────────────────
-def authorized():
+def authorized(payload=None):
     if not WEBHOOK_SECRET:
         return True
-    return request.headers.get("X-Webhook-Secret", "") == WEBHOOK_SECRET
+
+    # TradingView kann keinen freien X-Webhook-Secret-Header setzen.
+    # Deshalb akzeptieren wir zusätzlich das Feld "secret" im JSON-Body.
+    header_secret = request.headers.get("X-Webhook-Secret", "")
+    json_secret = ""
+    if isinstance(payload, dict):
+        json_secret = str(payload.get("secret", "") or "")
+
+    return (
+        hmac.compare_digest(header_secret, WEBHOOK_SECRET)
+        or hmac.compare_digest(json_secret, WEBHOOK_SECRET)
+    )
 
 
 def r2(x):
@@ -793,10 +805,10 @@ def webhook():
 
     with LOCK:
         try:
-            if not authorized():
-                return jsonify({"status": "error", "msg": "unauthorized"}), 401
-
             d = parse_json_body()
+
+            if not authorized(d):
+                return jsonify({"status": "error", "msg": "unauthorized"}), 401
             o = get_price(d, "o", "open")
             h = get_price(d, "h", "high")
             l = get_price(d, "l", "low")
