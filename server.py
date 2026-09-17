@@ -137,6 +137,15 @@ US_E = 14 * 60
 MAX_LOOKBACK = max(S1["LOOKBACK"], S2["LOOKBACK"])
 
 # ─────────────────────────────────────────────────────────────
+# BOOTSTRAP AUS TRADINGVIEW M3-EXPORT (nur Daily-H/L/C)
+# M3 wird NICHT als M5 umgedeutet: 3-Minuten-Bars schneiden 5-Minuten-Grenzen.
+# Die Daily-Grenze ist dagegen exakt ausrichtbar; daher ist dieser Seed sicher
+# für den abgeschlossenen Daily-Cache. M5 ATR/Lookback wärmen live neu auf.
+# ─────────────────────────────────────────────────────────────
+DAILY_BOOTSTRAP = [{'date': '2026-07-12', 'h': 74.66, 'l': 73.18, 'c': 74.53}, {'date': '2026-07-13', 'h': 80.42, 'l': 72.61, 'c': 79.78}, {'date': '2026-07-14', 'h': 81.27, 'l': 77.84, 'c': 79.78}, {'date': '2026-07-15', 'h': 80.93, 'l': 78.19, 'c': 79.37}, {'date': '2026-07-16', 'h': 80.87, 'l': 78.58, 'c': 79.19}, {'date': '2026-07-17', 'h': 82.07, 'l': 77.93, 'c': 81.77}, {'date': '2026-07-19', 'h': 84.6, 'l': 82.88, 'c': 83.55}, {'date': '2026-07-20', 'h': 84.2, 'l': 79.58, 'c': 82.14}, {'date': '2026-07-21', 'h': 85.75, 'l': 81.39, 'c': 85.43}, {'date': '2026-07-22', 'h': 88.67, 'l': 85.02, 'c': 88.13}, {'date': '2026-07-23', 'h': 93.5, 'l': 87.66, 'c': 91.65}, {'date': '2026-07-24', 'h': 91.86, 'l': 87.68, 'c': 90.47}, {'date': '2026-07-26', 'h': 86.2, 'l': 83.1, 'c': 84.84}, {'date': '2026-07-27', 'h': 84.96, 'l': 80.6, 'c': 81.63}, {'date': '2026-07-28', 'h': 83.3, 'l': 77.78, 'c': 82.04}, {'date': '2026-07-29', 'h': 85.57, 'l': 81.51, 'c': 84.05}, {'date': '2026-07-30', 'h': 85.94, 'l': 81.6, 'c': 81.66}, {'date': '2026-07-31', 'h': 86.87, 'l': 81.06, 'c': 86.8}, {'date': '2026-08-02', 'h': 81.3, 'l': 78.78, 'c': 79.52}, {'date': '2026-08-03', 'h': 81.3, 'l': 78.43, 'c': 81.23}, {'date': '2026-08-04', 'h': 82.33, 'l': 74.24, 'c': 75.15}, {'date': '2026-08-05', 'h': 76.7, 'l': 74.45, 'c': 74.81}, {'date': '2026-08-06', 'h': 78.77, 'l': 74.57, 'c': 78.32}, {'date': '2026-08-07', 'h': 78.5, 'l': 76.53, 'c': 77.08}, {'date': '2026-08-09', 'h': 79.43, 'l': 78.18, 'c': 78.45}, {'date': '2026-08-10', 'h': 82.52, 'l': 77.79, 'c': 82.24}, {'date': '2026-08-11', 'h': 84.61, 'l': 81.27, 'c': 83.7}, {'date': '2026-08-12', 'h': 84.1, 'l': 81.9, 'c': 83.0}, {'date': '2026-08-13', 'h': 83.3, 'l': 80.09, 'c': 81.38}, {'date': '2026-08-14', 'h': 82.99, 'l': 80.76, 'c': 82.4}, {'date': '2026-08-16', 'h': 83.04, 'l': 81.72, 'c': 82.15}, {'date': '2026-08-17', 'h': 85.04, 'l': 81.5, 'c': 84.34}, {'date': '2026-08-18', 'h': 85.14, 'l': 83.78, 'c': 84.61}, {'date': '2026-08-19', 'h': 85.84, 'l': 83.45, 'c': 84.47}, {'date': '2026-08-20', 'h': 87.69, 'l': 84.33, 'c': 86.24}, {'date': '2026-08-21', 'h': 87.51, 'l': 85.8, 'c': 86.64}, {'date': '2026-08-23', 'h': 86.57, 'l': 84.84, 'c': 85.61}, {'date': '2026-08-24', 'h': 86.24, 'l': 84.36, 'c': 85.08}, {'date': '2026-08-25', 'h': 85.09, 'l': 80.08, 'c': 80.61}, {'date': '2026-08-26', 'h': 83.31, 'l': 79.62, 'c': 81.83}, {'date': '2026-08-27', 'h': 84.27, 'l': 80.65, 'c': 83.27}, {'date': '2026-08-28', 'h': 83.71, 'l': 82.25, 'c': 83.44}, {'date': '2026-08-30', 'h': 85.69, 'l': 84.11, 'c': 85.35}, {'date': '2026-08-31', 'h': 87.09, 'l': 84.47, 'c': 87.0}, {'date': '2026-09-01', 'h': 92.29, 'l': 86.22, 'c': 90.54}, {'date': '2026-09-02', 'h': 91.48, 'l': 88.97, 'c': 90.57}, {'date': '2026-09-03', 'h': 93.14, 'l': 89.57, 'c': 91.61}, {'date': '2026-09-04', 'h': 91.78, 'l': 88.72, 'c': 91.22}, {'date': '2026-09-06', 'h': 92.6, 'l': 91.58, 'c': 92.46}, {'date': '2026-09-07', 'h': 93.29, 'l': 90.87, 'c': 93.06}, {'date': '2026-09-08', 'h': 94.78, 'l': 91.82, 'c': 93.99}, {'date': '2026-09-09', 'h': 97.79, 'l': 93.76, 'c': 96.08}, {'date': '2026-09-10', 'h': 104.46, 'l': 95.37, 'c': 102.33}, {'date': '2026-09-11', 'h': 102.36, 'l': 98.48, 'c': 99.99}, {'date': '2026-09-13', 'h': 103.6, 'l': 101.59, 'c': 102.69}, {'date': '2026-09-14', 'h': 104.95, 'l': 100.53, 'c': 103.23}, {'date': '2026-09-15', 'h': 106.75, 'l': 101.21, 'c': 104.63}, {'date': '2026-09-16', 'h': 104.99, 'l': 100.97, 'c': 102.21}]
+ACTIVE_DAILY_BOOTSTRAP = {'date': '2026-09-17', 'h': 102.26, 'l': 99.59, 'c': 99.96, 'last_ts': 1789646220.0}
+
+# ─────────────────────────────────────────────────────────────
 # RUNTIME STATE
 # ─────────────────────────────────────────────────────────────
 bars = deque(maxlen=600)
@@ -366,6 +375,26 @@ def import_legacy_days():
         return []
 
 
+
+def apply_embedded_bootstrap():
+    """Ergaenzt nur fehlende Daily-Zeilen; vorhandene Live-Daten gewinnen."""
+    global days, active_daily
+    by_date = {str(d["date"]): d for d in DAILY_BOOTSTRAP}
+    for d in days:
+        by_date[str(d["date"])] = d
+    days = [by_date[k] for k in sorted(by_date.keys())][-80:]
+
+    if active_daily is None:
+        active_daily = dict(ACTIVE_DAILY_BOOTSTRAP)
+    elif str(active_daily.get("date")) == str(ACTIVE_DAILY_BOOTSTRAP["date"]):
+        # Seed deckt den Export bis last_ts ab; falls State neuer ist, State-Close behalten.
+        boot = ACTIVE_DAILY_BOOTSTRAP
+        active_daily["h"] = max(float(active_daily["h"]), float(boot["h"]))
+        active_daily["l"] = min(float(active_daily["l"]), float(boot["l"]))
+        if float(boot.get("last_ts", 0)) > float(active_daily.get("last_ts", 0)):
+            active_daily["c"] = float(boot["c"])
+            active_daily["last_ts"] = float(boot["last_ts"])
+
 def load_state():
     global days, active_daily, long_zones, short_zones
     global bar_num, bars_today, prev_session, current_ct_date
@@ -373,6 +402,7 @@ def load_state():
 
     if not STATE_FILE.exists():
         days = import_legacy_days()
+        apply_embedded_bootstrap()
         save_state()
         print(f"[STATE] neu | days={len(days)}")
         return
@@ -406,6 +436,8 @@ def load_state():
 
         signal_history.clear()
         signal_history.extend(s.get("signal_history", [])[-1000:])
+
+        apply_embedded_bootstrap()
 
         print(
             f"[STATE] geladen bars={len(bars)} days={len(days)} "
