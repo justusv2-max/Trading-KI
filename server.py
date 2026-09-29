@@ -1,1079 +1,521 @@
-from __future__ import annotations
 
-"""
-CL Futures M5 | System 1 + 2 | Server v7.0 FINAL
-====================================================
+import pandas as pd, numpy as np, os, hashlib, json, textwrap, shutil
 
-ZWECK
------
-Live-Signalserver für die neue M1-validierte Strategie.
+base="/mnt/data"
+t=pd.read_csv(f"{base}/APEX50K_CP016_EXECUTED_TRADES.csv")
+t["date"]=pd.to_datetime(t["date"])
+t=t.sort_values(["date","ord","source"],kind="stable").reset_index(drop=True)
 
-STRATEGIEPARAMETER
-------------------
-S1 (ATR-Momentum <= 2.5):
-    LONG + SHORT
-    MM=0.05, SB=0.05, CRV=0.60, LOOKBACK=20, MAX_TICKS=15
-S2 (ATR-Momentum > 2.5):
-    nur Trendrichtung
-    MM=0.08, SB=0.07, CRV=0.70, LOOKBACK=30, MAX_TICKS=18
+# CP017: hard combined cap = first four actually executed trades of each authoritative Berlin trading date.
+cp17=t.groupby("date",sort=False,group_keys=False).head(4).copy()
+cp17["date"]=cp17["date"].dt.strftime("%Y-%m-%d")
+cp17.to_csv(f"{base}/APEX50K_CP017_MAX4_EXECUTED_TRADES.csv",index=False)
 
-Gemeinsam:
-    M5 ATR(14) <= 0.40
-    MAX_RISK=1.00
-    MOM_THRESH=2.5
-    Daily Momentum: letzter abgeschlossener Daily-Close gegen 20 Daily-Zeilen zurück,
-                    ATR = Mittelwert H-L der letzten 14 abgeschlossenen Dailys
-    Zone-Lock: 96 akzeptierte M5-Bars, LEVEL_TOL=0.05
-    Zone-Reset: neuer CT-Handelstag + Eintritt EU + Wechsel EU->US
-    EU: 02:00 <= CT < 08:30
-    US: 08:30 <= CT <= 14:00
-    Entry/Stop/Target: Python round(..., 2), Target = Entry +/- raw_risk * CRV
+daily=cp17.groupby("date",as_index=False)["pnl"].sum()
+daily["equity"]=daily["pnl"].cumsum()
+daily["peak"]=daily["equity"].cummax()
+daily["drawdown"]=daily["equity"]-daily["peak"]
+daily.to_csv(f"{base}/APEX50K_CP017_MAX4_DAILY_PNL.csv",index=False)
 
-WICHTIG ZUR BACKTEST-GLEICHHEIT
--------------------------------
-Der historische Referenz-Backtest, der zuletzt verwendet wurde, berechnet den
-Daily-ATR für einen Intraday-Tag aus der vollständigen H/L-Range dieses Tages.
-Das enthält Zukunftsinformation und kann live nicht 1:1 bekannt sein.
+# reset trailing-DD simulation
+eq=peak=0.; fails=[]
+for r in cp17.itertuples():
+    eq+=r.pnl; peak=max(peak,eq)
+    if eq-peak<=-2500:
+        fails.append({"date":r.date,"ord":int(r.ord),"breach_dd":round(eq-peak,2)})
+        eq=peak=0.
+pd.DataFrame(fails).to_csv(f"{base}/APEX50K_CP017_MAX4_TRAILING2500_FAILURES.csv",index=False)
 
-Dieser Server verwendet deshalb ausschließlich ABGESCHLOSSENE Daily-Daten.
-Alle übrigen Signalregeln sind so umgesetzt, wie sie in der Referenzlogik
-definiert wurden. Vor Live-Einsatz muss der Backtest mit genau dieser kausalen
-Daily-Berechnung erneut laufen. Erst danach darf diese Datei als endgültig
-"1:1 backtest-identisch" bezeichnet werden.
+net=cp17.pnl.sum()
+e=cp17.pnl.cumsum()
+trade_dd=(e-e.cummax()).min()
+worst_day=daily.pnl.min()
+daily_dd=daily.drawdown.min()
+print(dict(trades=len(cp17),net=round(net,2),trade_dd=round(trade_dd,2),
+           daily_close_dd=round(daily_dd,2),worst_day=round(worst_day,2),
+           trailing2500_failures=len(fails)))
+STDOUT/STDERR
+{'trades': 6671, 'net': np.float64(193388.8), 'trade_dd': np.float64(-5649.6), 'daily_close_dd': np.float64(-5506.8), 'worst_day': np.float64(-1141.6), 'trailing2500_failures': 21}
 
-M1 / EXECUTION
---------------
-Der Server erzeugt M5-Setups/Signale. Die historische M1-Regel
-"SL + TP in derselben M1-Kerze = LOSS" ist eine Backtest-Auswertungsregel und
-kann im M5-Signalserver nicht die echte Tick-Reihenfolge ersetzen.
-Der tatsächliche Order-Fill/SL/TP wird vom Ausführungs-Bridge/Broker bestimmt.
-
-TECHNIK
--------
-- genau EIN Gunicorn-Worker verwenden
-- atomare persistente State-Datei
-- Bars, Daily-Cache, aktive Daily-Kerze, Zonen, Session, Signalhistorie,
-  Duplicate-Schutz werden persistiert
-- strikte Timestamps, kein Serverzeit-Fallback
-- Duplicate- und Out-of-order-Schutz
-- optional WEBHOOK_SECRET über Header X-Webhook-Secret
-- kann bei erstmaligem Start Daily-Historie aus einem alten State importieren:
-      LEGACY_STATE_FILE=/data/cl_state_v6.json
-- empfohlener Start:
-      gunicorn cl_server_v7:app --workers 1 --threads 4 --timeout 30
-"""
-
-from flask import Flask, request, jsonify
-from collections import deque
+Analysiert
 from pathlib import Path
-from threading import RLock
-from zoneinfo import ZoneInfo
-import datetime as dt
-import hmac
-import hashlib
-import json
-import math
-import os
-import re
-import tempfile
-import urllib.request
+base=Path("/mnt/data")
 
-app = Flask(__name__)
-LOCK = RLock()
+master = r"""# CL/WTI — MASTER REPRODUCTION CHECKPOINT 017 — APEX50K MAX4
 
-# ─────────────────────────────────────────────────────────────
-# ENV / TIMEZONES
-# ─────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-STATE_FILE = Path(os.environ.get("STATE_FILE", "/data/cl_v7_state.json"))
-LEGACY_STATE_FILE = Path(os.environ.get("LEGACY_STATE_FILE", "/data/cl_state_v6.json"))
-LEGACY_STATE_CANDIDATES = [
-    LEGACY_STATE_FILE,
-    Path("/data/cl_v6_state.json"),
-    Path("/data/cl_v5_1_state.json"),
-    Path("/data/cl_v5_state.json"),
+Freeze date: 2026-09-29
+Status: LIVE CANDIDATE / FROZEN
+Parent: CP016 APEX50K. CP016 remains preserved and unchanged.
+
+## 1. Purpose
+CP017 is CP016 plus one simple, non-entry-parameter risk rule:
+**maximum 4 executed trades per Europe/Berlin trading day across System 2 + System 3 combined.**
+Once four trades have actually been executed on that Berlin date, all later entries are rejected until the next Berlin date.
+
+This is a pure portfolio/risk rule. No signal/setup parameter was optimized or changed.
+
+## 2. Exact historical result
+History: same source history as CP015/CP016 (2016 through Sep 2026).
+- Executed trades: 6,671
+- Net PnL: +$193,388.80 after $7.20 round-trip fee per executed trade
+- Trade-sequence MaxDD: -$5,649.60
+- Daily-close MaxDD: -$5,506.80
+- Worst realized Berlin day: -$1,141.60
+- Days below -$1,500: 0
+- $2,500 reset trailing-DD failure simulation: 21 failures
+
+IMPORTANT: the 21 count is a hypothetical risk simulation: equity high follows realized trade equity; when equity falls >=$2,500 below its running peak, that account is counted failed and the simulation restarts with equity=peak=0 for the next account. It is not a statement of any broker/prop firm's current official rules.
+
+## 3. Why the max-4 replay is exact relative to CP016
+CP017 accepts the first four CP016-executable trades of each authoritative Berlin trading date and rejects every later trade that date.
+Until trade #4 executes, CP017 state is identical to CP016. After trade #4, no later trade can become executable under CP017 regardless of a skipped S2/S3 candidate, because the combined daily cap remains exhausted until the date rolls.
+Therefore filtering the authoritative chronological CP016 executed stream to the first four executions/day exactly reproduces this additional portfolio rule; unlike selective setup filters, it cannot free a later same-day slot.
+
+## 4. Global contract/accounting assumptions
+- Instrument: CL/WTI futures
+- 1 contract in reference backtest
+- tick size $0.01
+- tick value $10
+- fee $7.20 round trip per executed trade
+- Monday-Friday
+- timezone-aware Europe/Berlin
+- entries only 08:00 <= Berlin < 20:00
+- all positions flat no later than 20:00 Berlin
+- no overnight
+- completed bars only / no lookahead
+- conservative stop-first if SL and TP are both touched ambiguously on same M1 bar
+
+## 5. CP016 risk layer retained
+Preventive daily risk budget: $1,500.
+Before every new trade:
+    realized_day_pnl - full_stop_risk >= -1500
+Full stop risks including fee:
+- HV-1 $157.20
+- HV-2 $157.20
+- LV-1 $87.20
+- LV-2 $87.20
+- LV-3 $87.20
+- A_DIR_BREAK $807.20
+- C_MOM_CONT $607.20
+- D_RANGE_FAIL $1,007.20
+
+S2 also retains: after FOUR realized losing S2 trades on a Berlin day, no later S2 entry that day.
+
+## 6. CP017 new portfolio rule
+MAX_COMBINED_TRADES_PER_BERLIN_DAY = 4
+Count only EXECUTED entries, S2 + S3 together.
+Rejected/unfilled/cancelled orders do not consume a slot.
+Counter resets only when Europe/Berlin calendar date changes.
+This gate is checked before accepting a new entry and after the $1,500 risk gate has been evaluated. Since both must pass, ordering does not alter accepted trades when neither gate mutates state on rejection.
+
+## 7. System 2 frozen rules
+Authoritative source: FINAL_SYSTEM2_SPEC_2026-09-29.md and streaming_final_s2_rawctx.csv.
+Enabled only: HV-1, HV-2, LV-1, LV-2, LV-3. BOS excluded. RANGE context not traded.
+ATR5 = prior five completed session ranges in ticks; current session excluded.
+Directional context from previous-week/month 70% TPO VA and 09:00 ET session open.
+Round-number grid $0.50, +/-$5 around session open, one executed trade per bucket/session/subsystem; LV-2 max one/session.
+HV-1: HV, directional, RN rejection, bounce>=10T, SL15/TP15, max wait80 M1.
+HV-2: HV, directional, new session extreme + confirmation bounce>=4T, SL15/TP15, max wait80 M1.
+LV-1: LV, directional, RN rejection, bounce>=5T, SL8/TP8, max wait80 M1.
+LV-2: LV, directional, rolling completed-M30 VAL/VAH reclaim, cumulative bounce>=8T, SL8/TP8, max wait80 M1, max1/session.
+LV-3: LV, directional, new session extreme + reclaim, no bounce minimum, SL8/TP8, max wait80 M1.
+
+## 8. System 3 exact CP015/016 rules retained
+S3 max 2 executed trades/Berlin day; no overlapping S3 position; simultaneous priority C > D > B > A; B disabled.
+A_DIR_BREAK:
+- HV; directional context; M5 LB8 breakout; directional candle; body/range>=0.40
+- 08:00-<10:30 Berlin
+- break distance <=13T
+- previous completed-session momentum aligned >= -75T
+- body <=45T
+- SL80T / TP60T
+C_MOM_CONT:
+- LV; directional context
+- previous-session momentum >=60T intended direction
+- body>=20T; close within5T intended candle extreme
+- 08:00-<17:00 Berlin
+- SL60T / TP60T
+D_RANGE_FAIL:
+- HV; RANGE; M5 LB16 failed break/reversal
+- penetration>=5T
+- 08:00-<14:00 Berlin
+- SL100T / TP140T
+
+S3 execution: first M1 open at/after completed M5 signal; chronological M1 exit; same-bar SL+TP => stop first; last same-Berlin-day close if data ends early.
+
+## 9. Context/TPO authoritative construction
+70% TPO VA on M30.
+Previous Week/Month VAH/VAL use only fully completed periods.
+Reference session open 09:00 ET.
+Context priority:
+1 open>PW_VAH and >PM_VAH => TREND_BULL
+2 open<PW_VAL and <PM_VAL => TREND_BEAR
+3 open>PM_VAH => MONTHLY_BULL
+4 open<PM_VAL => MONTHLY_BEAR
+5 open>PW_VAH => WEEKLY_BULL
+6 open<PW_VAL => WEEKLY_BEAR
+7 else RANGE
+TPO M30 is causal; each completed M30 contributes one TPO per $0.01 high-low level. POC highest count, lower/first on tie. 70% VA expands one tick toward adjacent larger count; tie downward first.
+
+## 10. Required files / lineage
+Core CP017:
+- MASTER_REPRODUCTION_CHECKPOINT_017_APEX50K_MAX4.md
+- APEX50K_CP017_MAX4_EXECUTED_TRADES.csv
+- APEX50K_CP017_MAX4_DAILY_PNL.csv
+- APEX50K_CP017_MAX4_TRAILING2500_FAILURES.csv
+- railway_cp017_apex50k_max4.py
+- CHECKPOINT_017_APEX50K_MAX4_MANIFEST.sha256
+
+Parents/raw:
+- MASTER_REPRODUCTION_CHECKPOINT_015_EXACT.md
+- MASTER_REPRODUCTION_CHECKPOINT_016_APEX50K.md
+- streaming_final_s2_rawctx.csv
+- S3V2_CORRECTED_SIGNALS_08_20.pkl
+- CL-3.txt
+- CL-4(6).txt
+- FINAL_SYSTEM2_SPEC_2026-09-29.md
+
+## 11. Acceptance checks in any future chat
+Before modifying CP017, verify:
+- CP015 unfiltered S3 replay = 3,665 trades / +$241,732.00
+- CP015 filtered S3 = 1,472 / +$150,061.60
+- CP015 combined = +$270,806.00
+- CP016 = 7,830 trades / +$270,254.00 / 15 prevented by $1,500 budget
+- CP017 = 6,671 trades / +$193,388.80
+- CP017 trade-sequence DD = -$5,649.60
+- CP017 daily-close DD = -$5,506.80
+- CP017 worst day = -$1,141.60
+- CP017 $2,500 reset-trailing simulation = 21 failures
+
+If these do not reproduce, STOP and resolve the discrepancy before optimization/live changes.
+
+## 12. Railway boundary
+railway_cp017_apex50k_max4.py is the frozen signal/risk engine module. It does NOT invent a market-data vendor, broker API, or Telegram credentials. A Railway deployment must connect this engine to an actual real-time M1/M5 feed and persist PortfolioState across restarts. The live adapter must call the same causal context logic and must not manufacture incomplete M30/week/month data.
+"""
+(base/"MASTER_REPRODUCTION_CHECKPOINT_017_APEX50K_MAX4.md").write_text(master)
+
+src=(base/"railway_cp016_apex50k.py").read_text()
+src=src.replace("CP016 APEX50K","CP017 APEX50K MAX4")
+src=src.replace("Checkpoint: MASTER_REPRODUCTION_CHECKPOINT_016_APEX50K.md",
+                "Checkpoint: MASTER_REPRODUCTION_CHECKPOINT_017_APEX50K_MAX4.md")
+src=src.replace("# CP015\nMAX_S3_TRADES_PER_BERLIN_DAY = 2",
+"""# CP015/CP016 retained + CP017 combined daily cap
+MAX_COMBINED_TRADES_PER_BERLIN_DAY = 4
+MAX_S3_TRADES_PER_BERLIN_DAY = 2""")
+src=src.replace("""        self.s3_trades_today = 0
+        self.s2_realized_losses_today = 0""",
+"""        self.combined_trades_today = 0
+        self.s3_trades_today = 0
+        self.s2_realized_losses_today = 0""")
+src=src.replace("""            self.s3_trades_today=0
+            self.s2_realized_losses_today=0""",
+"""            self.combined_trades_today=0
+            self.s3_trades_today=0
+            self.s2_realized_losses_today=0""")
+src=src.replace("""        return (not self.s3_position_open and
+                self.s3_trades_today < MAX_S3_TRADES_PER_BERLIN_DAY and
+                in_window(sig.entry_eligible_berlin,480,1200))""",
+"""        return (not self.s3_position_open and
+                self.combined_trades_today < MAX_COMBINED_TRADES_PER_BERLIN_DAY and
+                self.s3_trades_today < MAX_S3_TRADES_PER_BERLIN_DAY and
+                in_window(sig.entry_eligible_berlin,480,1200))""")
+src=src.replace("""    def register_s3_entry(self):
+        self.s3_trades_today += 1
+        self.s3_position_open = True""",
+"""    def register_s3_entry(self):
+        self.combined_trades_today += 1
+        self.s3_trades_today += 1
+        self.s3_position_open = True""")
+src=src.replace("""        return self.s2_realized_losses_today < S2_MAX_REALIZED_LOSSES_PER_DAY and in_window(now,480,1200)""",
+"""        return (self.combined_trades_today < MAX_COMBINED_TRADES_PER_BERLIN_DAY and
+                self.s2_realized_losses_today < S2_MAX_REALIZED_LOSSES_PER_DAY and
+                in_window(now,480,1200))""")
+# add explicit S2 executed entry registration
+needle="""    def register_s2_realized_pnl(self, now: datetime, pnl: float):
+"""
+insert="""    def register_s2_entry(self, now: datetime):
+        self.roll_day(now)
+        if self.combined_trades_today >= MAX_COMBINED_TRADES_PER_BERLIN_DAY:
+            raise RuntimeError("CP017 combined daily trade cap exhausted")
+        self.combined_trades_today += 1
+
+"""
+src=src.replace(needle,insert+needle)
+src=src.replace("# Railway process should call cp015_signal()",
+"""# IMPORTANT CP017 acceptance order for every candidate entry:
+# 1) roll Berlin day; 2) candidate must satisfy setup rules;
+# 3) apex_risk_gate(realized_day_pnl, setup) must pass;
+# 4) PortfolioState daily/S2/S3/no-overlap gates must pass;
+# 5) only an ACTUALLY EXECUTED entry calls register_s2_entry/register_s3_entry.
+# Unfilled/cancelled/rejected candidates do NOT consume the four daily slots.
+#
+# Railway process should call cp015_signal()""")
+(base/"railway_cp017_apex50k_max4.py").write_text(src)
+
+# Verify syntax
+import py_compile
+py_compile.compile(str(base/"railway_cp017_apex50k_max4.py"),doraise=True)
+print("Master + CP017 engine created; syntax OK.")
+STDOUT/STDERR
+Master + CP017 engine created; syntax OK.
+
+Analysiert
+from pathlib import Path
+import hashlib, zipfile, pandas as pd, textwrap, os
+base=Path("/mnt/data")
+
+verify=r'''#!/usr/bin/env python3
+import pandas as pd, sys
+F="APEX50K_CP017_MAX4_EXECUTED_TRADES.csv"
+t=pd.read_csv(F)
+assert len(t)==6671, len(t)
+assert abs(t.pnl.sum()-193388.80)<1e-6, t.pnl.sum()
+assert t.groupby("date").size().max()<=4
+e=t.pnl.cumsum()
+assert abs((e-e.cummax()).min()-(-5649.60))<1e-6
+d=t.groupby("date").pnl.sum()
+de=d.cumsum()
+assert abs((de-de.cummax()).min()-(-5506.80))<1e-6
+assert abs(d.min()-(-1141.60))<1e-6
+eq=peak=0.; fails=0
+for p in t.pnl:
+    eq+=p; peak=max(peak,eq)
+    if eq-peak<=-2500:
+        fails+=1; eq=peak=0.
+assert fails==21, fails
+print("CP017 VERIFIED: 6671 trades | +$193,388.80 | trade DD -$5,649.60 | daily DD -$5,506.80 | trailing2500 failures 21")
+'''
+(base/"verify_checkpoint_017.py").write_text(verify)
+
+readme=r"""# Railway CP017 package
+
+Primary engine: `railway_cp017_apex50k_max4.py`
+Frozen specification: `MASTER_REPRODUCTION_CHECKPOINT_017_APEX50K_MAX4.md`
+
+The engine contains the exact CP015 S3 signal detector plus CP016 $1,500 preventive daily-risk gate and CP017 combined max-4 executed-trades/day state.
+
+System 2's authoritative signal rules are frozen in `FINAL_SYSTEM2_SPEC_2026-09-29.md`. Do not replace them with an older BOS/Monday-blocking source. For a full production Railway service, connect the frozen engines to the chosen real-time M1/M5 feed, implement the authoritative causal M30/week/month context builder, persist state across restarts, and then connect alerts/broker actions.
+
+Never count a rejected/cancelled/unfilled candidate against the max-4 cap. Count an entry only after execution is confirmed.
+"""
+(base/"README_CP017_RAILWAY.md").write_text(readme)
+
+files=[
+"MASTER_REPRODUCTION_CHECKPOINT_017_APEX50K_MAX4.md",
+"APEX50K_CP017_MAX4_EXECUTED_TRADES.csv",
+"APEX50K_CP017_MAX4_DAILY_PNL.csv",
+"APEX50K_CP017_MAX4_TRAILING2500_FAILURES.csv",
+"railway_cp017_apex50k_max4.py",
+"verify_checkpoint_017.py",
+"README_CP017_RAILWAY.md",
 ]
+manifest=[]
+for f in files:
+    h=hashlib.sha256((base/f).read_bytes()).hexdigest()
+    manifest.append(f"{h}  {f}")
+(base/"CHECKPOINT_017_APEX50K_MAX4_MANIFEST.sha256").write_text("\n".join(manifest)+"\n")
+files.append("CHECKPOINT_017_APEX50K_MAX4_MANIFEST.sha256")
 
-CET = ZoneInfo("Europe/Berlin")
-CT = ZoneInfo("America/Chicago")
-ET = ZoneInfo("America/New_York")
-UTC = dt.timezone.utc
+zip_path=base/"CP017_APEX50K_MAX4_RECONSTRUCTION_AND_RAILWAY.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for f in files:
+        z.write(base/f,arcname=f)
 
-VERSION = "7.0.2"
+# run verifier in its intended directory
+os.system(f"cd {base} && python verify_checkpoint_017.py")
+print(zip_path, zip_path.stat().st_size)
+STDOUT/STDERR
+Spreadsheet runtime warmup failed during python startup
+Traceback (most recent call last):
+  File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/patches/warm_spreadsheet_runtime_on_startup.py", line 26, in warm_spreadsheet_runtime_on_startup
+  File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/spreadsheet_warmup.py", line 785, in warm_spreadsheet_runtime
+  File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/spreadsheet_warmup.py", line 720, in _warm_feature_flows
+  File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/spreadsheet_warmup.py", line 704, in _warm_collaboration_flows
+  File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/generated/interface/models.py", line 32317, in hydrate_crdt_from_proto
+  File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/rpc/remote.py", line 749, in __call__
+  File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/rpc/client.py", line 150, in call
+artifact_tool.rpc.client.RemoteError: hydrateCrdtFromProto requires an empty collaborative document.
+CP017 VERIFIED: 6671 trades | +$193,388.80 | trade DD -$5,649.60 | daily DD -$5,506.80 | trailing2500 failures 21
+/mnt/data/CP017_APEX50K_MAX4_RECONSTRUCTION_AND_RAILWAY.zip 81211
+Ja. CP017 ist jetzt als neue eingefrorene Apex-50k-Livevariante angelegt und zusätzlich dauerhaft in deiner Library unter /CL_WTI_CP017/ gespeichert.
 
-# ─────────────────────────────────────────────────────────────
-# FIXIERTE STRATEGIEPARAMETER
-# ─────────────────────────────────────────────────────────────
-S1 = {
-    "MM": 0.05,
-    "SB": 0.05,
-    "CRV": 0.60,
-    "LOOKBACK": 20,
-    "MAX_TICKS": 15,
-}
-S2 = {
-    "MM": 0.08,
-    "SB": 0.07,
-    "CRV": 0.70,
-    "LOOKBACK": 30,
-    "MAX_TICKS": 18,
-}
+Die feste neue Regel lautet: maximal 4 tatsächlich ausgeführte Trades pro Berlin-Handelstag über S2 + S3 zusammen. CP016 bleibt unverändert als Eltern-Checkpoint erhalten. CP017 reproduziert 6.671 Trades, +$193.388,80 netto, −$5.649,60 Trade-DD, −$5.506,80 Daily-Close-DD und 21 historische $2.500-Trailing-Brüche. Der automatische Verifier hat diese Werte erfolgreich bestätigt.
 
-MAX_RISK = 1.00
-ATR_MAX = 0.40
-ATR_LEN = 14
-MOM_THRESH = 2.5
-MOM_WINDOW = 20
-ZONE_BARS = 96
-LEVEL_TOL = 0.05
+Wichtig beim Railway-Code: Er enthält die eingefrorene S3-Signalerkennung sowie CP016-Risikogate und das neue CP017-4-Trades-Limit. Die konkrete Echtzeit-Marktdaten-/Broker-Anbindung habe ich nicht erfunden, weil wir dafür noch keinen verbindlichen Feed festgelegt haben. Die vollständigen S2-Regeln und die kausale Kontextkonstruktion sind im Master eindeutig referenziert. 
+
+
+Hier sind die wichtigsten Dateien:
+
+Komplettes CP017-Paket herunterladen
+
+CP017 Master-Rekonstruktion
+
+Railway CP017 Signal-/Risk-Engine
+
+Exakter CP017 Trade-Log
+
+CP017 Verifier
+
+SHA256-Manifest
+
+Damit kann ein neuer Chat gezielt CP017 aus der Library laden, die Acceptance-Werte prüfen und von genau diesem Stand weiterarbeiten, statt alte Systeme oder Parameter zusammenzumischen. 
+
+
+MASTER_REPRODUCTION_CHECKPOINT_017_APEX50K_MAX4.md
+Dokument
+
+
+railway_cp017_apex50k_max4.py
+Code
+
+
+APEX50K_CP017_MAX4_EXECUTED_TRADES.csv
+Arbeitsblatt
+
+
+verify_checkpoint_017.py
+Code
+
+Weniger anzeigen
+
+Und 1500 verlust limit ist auch drin?
+
+Ja. Das präventive $1.500-Tagesverlustlimit aus CP016 ist in CP017 weiterhin vollständig enthalten.
+
+Das bedeutet: Vor jedem neuen Trade wird geprüft, ob der bereits realisierte Tages-PnL minus das volle Stop-Risiko des nächsten Trades inklusive $7,20 Gebühren unter −$1.500 fallen könnte. Wenn ja → kein Trade.
+
+CP017 hat damit gleichzeitig:
+
+max. 4 ausgeführte Trades pro Tag
+
+präventives Tages-Risikobudget $1.500
+
+zusätzlich bei S2 weiterhin Stop nach 4 realisierten S2-Verlusttrades
+
+20:00-Uhr-Hard-Close / kein Overnight
+
+alle ursprünglichen CP016-Regeln bleiben erhalten
+
+Im CP017-Backtest war deshalb der schlimmste Tag nur −$1.141,60 und es gab 0 Tage unter −$1.500.
+
+Also ja: 4 Trades/Tag + $1.500 Verlustschutz ist genau die jetzt gespeicherte CP017-Version.
+
+
+Okay machen wir passend dazu doe webhooks von tradingview ?
+
+Ja. Als Nächstes können wir die TradingView → Railway Webhooks passend zu CP017 bauen.
+
+Dabei würde ich TradingView möglichst „dumm“ halten: TradingView sendet abgeschlossene M1/M5-Bars bzw. notwendige Marktdaten an Railway, und Railway entscheidet anhand der eingefrorenen CP017-Logik, ob tatsächlich ein Signal entsteht. So liegen insbesondere $1.500-Risikogate, max. 4 Trades/Tag, S2/S3-Zähler, 20:00-Cutoff und De-Dup zentral auf dem Server und können nicht zwischen TradingView und Railway auseinanderlaufen.
+
+Dafür brauchen wir zwei Seiten: einen Pine-Script-Webhook-Sender für TradingView und einen Webhook-Endpunkt in Railway, der die Daten validiert und an CP017 übergibt. Danach können die fertigen Signale z. B. an Telegram weitergeschickt werden.
+
+Das würde ich genau auf Basis der gerade eingefrorenen CP017-Dateien bauen, ohne die Strategieparameter noch einmal anzufassen.
+
+
+Ich release erstmal den github code um zu schauen ob es keine fehler gibt und soll ich dir für die Berechnung und den Speicher vom Server die Aktuellen csv Dateien geben aus m1 und m5 mit dem sktuellen datum damit wir alle berechnungen direkt richtig haben ?
+
+Ja, genau so würde ich es machen.
+
+Release/deploy zuerst den aktuellen GitHub-/Railway-Code und schau, ob Railway sauber startet oder konkrete Fehler ausgibt. Danach gib mir unbedingt die aktuellsten CSVs für M1 und M5, idealerweise jeweils bis zum neuesten verfügbaren abgeschlossenen Bar.
+
+Die sind für den Live-Start sehr hilfreich, weil wir damit den Server einmal sauber „warm starten“ können: ATR5, Previous Week/Month Value Areas, Session-Kontext, M30/TPO-Zustand, laufende Session-Extrema usw. können aus echter Historie aufgebaut werden. Dann muss der Server beim Start nicht mit leerem Kontext beginnen.
+
+Wichtig: Bitte die CSVs nicht verändern oder kürzen. Schick mir einfach die aktuellen Originaldateien aus TradingView, so wie du sie bekommst. Dann prüfe ich zuerst Format, Zeitzone, letzte Zeitstempel und Lücken und passe anschließend den Server-Start so an, dass CP017 nach einem Railway-Neustart reproduzierbar wieder denselben Zustand aufbaut.
+
+Und wenn beim ersten Release vorher schon ein Railway-Fehler kommt, schick mir einfach den kompletten Fehlertext/Screenshot – dann beheben wir zuerst den.
+
+
+Keine ausgewählt
+Bibliothek
+/
+railway_cp017_apex50k_max4.py
+railway_c…k_max4.py
+
+
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+#!/usr/bin/env python3
+"""
+CL/WTI LIVE SIGNAL ENGINE — CP017 APEX50K MAX4
+Checkpoint: MASTER_REPRODUCTION_CHECKPOINT_017_APEX50K_MAX4.md
+
+IMPORTANT
+- This is the deployment/live signal engine specification for the exact CP015 rules.
+- It consumes completed M5 bars plus precomputed causal context fields.
+- It never uses future bars.
+- Europe/Berlin entry window and hard-flat rules are mandatory.
+- Fees are accounting/backtest assumptions; broker fills remain broker-side.
+"""
+
+import os
+from dataclasses import dataclass
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
+from typing import Optional, Dict, Any, List
+
 TICK = 0.01
-
-EU_S = 2 * 60
-EU_E = 8 * 60 + 30
-US_S = 8 * 60 + 30
-US_E = 14 * 60
-
-MAX_LOOKBACK = max(S1["LOOKBACK"], S2["LOOKBACK"])
-
-# ─────────────────────────────────────────────────────────────
-# BOOTSTRAP AUS TRADINGVIEW M3-EXPORT (nur Daily-H/L/C)
-# M3 wird NICHT als M5 umgedeutet: 3-Minuten-Bars schneiden 5-Minuten-Grenzen.
-# Die Daily-Grenze ist dagegen exakt ausrichtbar; daher ist dieser Seed sicher
-# für den abgeschlossenen Daily-Cache. M5 ATR/Lookback wärmen live neu auf.
-# ─────────────────────────────────────────────────────────────
-DAILY_BOOTSTRAP = [{'date': '2026-07-12', 'h': 74.66, 'l': 73.18, 'c': 74.53}, {'date': '2026-07-13', 'h': 80.42, 'l': 72.61, 'c': 79.78}, {'date': '2026-07-14', 'h': 81.27, 'l': 77.84, 'c': 79.78}, {'date': '2026-07-15', 'h': 80.93, 'l': 78.19, 'c': 79.37}, {'date': '2026-07-16', 'h': 80.87, 'l': 78.58, 'c': 79.19}, {'date': '2026-07-17', 'h': 82.07, 'l': 77.93, 'c': 81.77}, {'date': '2026-07-19', 'h': 84.6, 'l': 82.88, 'c': 83.55}, {'date': '2026-07-20', 'h': 84.2, 'l': 79.58, 'c': 82.14}, {'date': '2026-07-21', 'h': 85.75, 'l': 81.39, 'c': 85.43}, {'date': '2026-07-22', 'h': 88.67, 'l': 85.02, 'c': 88.13}, {'date': '2026-07-23', 'h': 93.5, 'l': 87.66, 'c': 91.65}, {'date': '2026-07-24', 'h': 91.86, 'l': 87.68, 'c': 90.47}, {'date': '2026-07-26', 'h': 86.2, 'l': 83.1, 'c': 84.84}, {'date': '2026-07-27', 'h': 84.96, 'l': 80.6, 'c': 81.63}, {'date': '2026-07-28', 'h': 83.3, 'l': 77.78, 'c': 82.04}, {'date': '2026-07-29', 'h': 85.57, 'l': 81.51, 'c': 84.05}, {'date': '2026-07-30', 'h': 85.94, 'l': 81.6, 'c': 81.66}, {'date': '2026-07-31', 'h': 86.87, 'l': 81.06, 'c': 86.8}, {'date': '2026-08-02', 'h': 81.3, 'l': 78.78, 'c': 79.52}, {'date': '2026-08-03', 'h': 81.3, 'l': 78.43, 'c': 81.23}, {'date': '2026-08-04', 'h': 82.33, 'l': 74.24, 'c': 75.15}, {'date': '2026-08-05', 'h': 76.7, 'l': 74.45, 'c': 74.81}, {'date': '2026-08-06', 'h': 78.77, 'l': 74.57, 'c': 78.32}, {'date': '2026-08-07', 'h': 78.5, 'l': 76.53, 'c': 77.08}, {'date': '2026-08-09', 'h': 79.43, 'l': 78.18, 'c': 78.45}, {'date': '2026-08-10', 'h': 82.52, 'l': 77.79, 'c': 82.24}, {'date': '2026-08-11', 'h': 84.61, 'l': 81.27, 'c': 83.7}, {'date': '2026-08-12', 'h': 84.1, 'l': 81.9, 'c': 83.0}, {'date': '2026-08-13', 'h': 83.3, 'l': 80.09, 'c': 81.38}, {'date': '2026-08-14', 'h': 82.99, 'l': 80.76, 'c': 82.4}, {'date': '2026-08-16', 'h': 83.04, 'l': 81.72, 'c': 82.15}, {'date': '2026-08-17', 'h': 85.04, 'l': 81.5, 'c': 84.34}, {'date': '2026-08-18', 'h': 85.14, 'l': 83.78, 'c': 84.61}, {'date': '2026-08-19', 'h': 85.84, 'l': 83.45, 'c': 84.47}, {'date': '2026-08-20', 'h': 87.69, 'l': 84.33, 'c': 86.24}, {'date': '2026-08-21', 'h': 87.51, 'l': 85.8, 'c': 86.64}, {'date': '2026-08-23', 'h': 86.57, 'l': 84.84, 'c': 85.61}, {'date': '2026-08-24', 'h': 86.24, 'l': 84.36, 'c': 85.08}, {'date': '2026-08-25', 'h': 85.09, 'l': 80.08, 'c': 80.61}, {'date': '2026-08-26', 'h': 83.31, 'l': 79.62, 'c': 81.83}, {'date': '2026-08-27', 'h': 84.27, 'l': 80.65, 'c': 83.27}, {'date': '2026-08-28', 'h': 83.71, 'l': 82.25, 'c': 83.44}, {'date': '2026-08-30', 'h': 85.69, 'l': 84.11, 'c': 85.35}, {'date': '2026-08-31', 'h': 87.09, 'l': 84.47, 'c': 87.0}, {'date': '2026-09-01', 'h': 92.29, 'l': 86.22, 'c': 90.54}, {'date': '2026-09-02', 'h': 91.48, 'l': 88.97, 'c': 90.57}, {'date': '2026-09-03', 'h': 93.14, 'l': 89.57, 'c': 91.61}, {'date': '2026-09-04', 'h': 91.78, 'l': 88.72, 'c': 91.22}, {'date': '2026-09-06', 'h': 92.6, 'l': 91.58, 'c': 92.46}, {'date': '2026-09-07', 'h': 93.29, 'l': 90.87, 'c': 93.06}, {'date': '2026-09-08', 'h': 94.78, 'l': 91.82, 'c': 93.99}, {'date': '2026-09-09', 'h': 97.79, 'l': 93.76, 'c': 96.08}, {'date': '2026-09-10', 'h': 104.46, 'l': 95.37, 'c': 102.33}, {'date': '2026-09-11', 'h': 102.36, 'l': 98.48, 'c': 99.99}, {'date': '2026-09-13', 'h': 103.6, 'l': 101.59, 'c': 102.69}, {'date': '2026-09-14', 'h': 104.95, 'l': 100.53, 'c': 103.23}, {'date': '2026-09-15', 'h': 106.75, 'l': 101.21, 'c': 104.63}, {'date': '2026-09-16', 'h': 104.99, 'l': 100.97, 'c': 102.21}]
-ACTIVE_DAILY_BOOTSTRAP = {'date': '2026-09-17', 'h': 102.26, 'l': 99.59, 'c': 99.96, 'last_ts': 1789646220.0}
-
-# ─────────────────────────────────────────────────────────────
-# RUNTIME STATE
-# ─────────────────────────────────────────────────────────────
-bars = deque(maxlen=600)
-days = []                     # nur ABGESCHLOSSENE Custom-Dailys
-active_daily = None           # laufender Custom-Day
-long_zones = []               # [(level, expire_bar_num), ...]
-short_zones = []
-bar_num = 0
-bars_today = 0
-prev_session = None
-current_ct_date = None
-last_bar_ts = None
-recent_bar_ts = deque(maxlen=2000)
-recent_bar_set = set()
-signals_today = []
-signal_history = deque(maxlen=1000)
-
-
-# ─────────────────────────────────────────────────────────────
-# GENERIC HELPERS
-# ─────────────────────────────────────────────────────────────
-def authorized(payload=None):
-    if not WEBHOOK_SECRET:
-        return True
-
-    # TradingView kann keinen freien X-Webhook-Secret-Header setzen.
-    # Deshalb akzeptieren wir zusätzlich das Feld "secret" im JSON-Body.
-    header_secret = request.headers.get("X-Webhook-Secret", "")
-    json_secret = ""
-    if isinstance(payload, dict):
-        json_secret = str(payload.get("secret", "") or "")
-
-    return (
-        hmac.compare_digest(header_secret, WEBHOOK_SECRET)
-        or hmac.compare_digest(json_secret, WEBHOOK_SECRET)
-    )
-
-
-def r2(x):
-    # Backtest-Semantik: Python round(..., 2)
-    return round(float(x), 2)
-
-
-def parse_json_body():
-    raw = request.get_data(as_text=True)
-    if not raw or not raw.strip():
-        raise ValueError("empty body")
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        fixed = re.sub(
-            r'"t":([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+-]+Z?)',
-            r'"t":"\1"',
-            raw,
-        )
-        try:
-            return json.loads(fixed)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"json parse error: {e.msg}") from e
-
-
-def get_price(d, short_key, long_key):
-    if short_key in d:
-        return float(d[short_key])
-    if long_key in d:
-        return float(d[long_key])
-    raise ValueError(f"Feld '{short_key}'/'{long_key}' fehlt")
-
-
-def parse_timestamp(value):
-    """Epoch sec/ms oder ISO-8601 mit Zeitzone. Kein Serverzeit-Fallback."""
-    if value is None or value == "":
-        raise ValueError("timestamp 't' fehlt")
-
-    if isinstance(value, (int, float)):
-        ts = float(value)
-    else:
-        s = str(value).strip()
-        try:
-            ts = float(s)
-        except ValueError:
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            try:
-                x = dt.datetime.fromisoformat(s)
-            except ValueError as e:
-                raise ValueError(f"ungültiger ISO timestamp: {value}") from e
-            if x.tzinfo is None:
-                raise ValueError("ISO timestamp benötigt Zeitzone/Z")
-            ts = x.timestamp()
-
-    if ts > 10_000_000_000:
-        ts /= 1000.0
-    if not math.isfinite(ts) or ts <= 0:
-        raise ValueError("ungültiger timestamp")
-    return ts
-
-
-def validate_ohlcv(o, h, l, c, v):
-    vals = (o, h, l, c, v)
-    if not all(math.isfinite(x) for x in vals):
-        raise ValueError("OHLCV enthält NaN/Inf")
-    if min(o, h, l, c) <= 0:
-        raise ValueError("OHLC muss > 0 sein")
-    if h < max(o, l, c) or l > min(o, h, c):
-        raise ValueError("inkonsistente OHLC-Werte")
-    if v < 0:
-        raise ValueError("volume < 0")
-
-
-def remember_ts(ts):
-    key = int(round(float(ts)))
-    if key in recent_bar_set:
-        return False
-    if len(recent_bar_ts) == recent_bar_ts.maxlen:
-        old = recent_bar_ts[0]
-        recent_bar_set.discard(old)
-    recent_bar_ts.append(key)
-    recent_bar_set.add(key)
-    return True
-
-
-# ─────────────────────────────────────────────────────────────
-# TIME / SESSION
-# ─────────────────────────────────────────────────────────────
-def ct_dt(ts):
-    return dt.datetime.fromtimestamp(float(ts), tz=CT)
-
-
-def ct_min(ts):
-    x = ct_dt(ts)
-    return x.hour * 60 + x.minute
-
-
-def ct_date_str(ts):
-    return ct_dt(ts).date().isoformat()
-
-
-def weekday_ct(ts):
-    return ct_dt(ts).weekday() < 5
-
-
-def in_eu(ts):
-    return EU_S <= ct_min(ts) < EU_E
-
-
-def in_us(ts):
-    # Referenz-Backtest: 14:00 eingeschlossen.
-    return US_S <= ct_min(ts) <= US_E
-
-
-def session_code(ts):
-    if in_eu(ts):
-        return "EU"
-    if in_us(ts):
-        return "US"
-    return None
-
-
-def session_label(ts):
-    s = session_code(ts)
-    return "EU Session" if s == "EU" else ("US Session" if s == "US" else "")
-
-
-def in_any_session(ts):
-    return session_code(ts) is not None
-
-
-# ─────────────────────────────────────────────────────────────
-# PERSISTENCE
-# ─────────────────────────────────────────────────────────────
-def state_dict():
-    return {
-        "version": VERSION,
-        "bars": list(bars),
-        "days": days[-80:],
-        "active_daily": active_daily,
-        "long_zones": long_zones,
-        "short_zones": short_zones,
-        "bar_num": bar_num,
-        "bars_today": bars_today,
-        "prev_session": prev_session,
-        "current_ct_date": current_ct_date,
-        "last_bar_ts": last_bar_ts,
-        "recent_bar_ts": list(recent_bar_ts),
-        "signals_today": signals_today[-200:],
-        "signal_history": list(signal_history),
-    }
-
-
-def save_state():
-    """Atomisches JSON-Replace."""
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(state_dict(), separators=(",", ":"), ensure_ascii=False)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=STATE_FILE.name + ".",
-        dir=str(STATE_FILE.parent),
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_name, STATE_FILE)
-    finally:
-        if os.path.exists(tmp_name):
-            try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
-
-
-def import_legacy_days():
-    """Nur Daily-Historie migrieren; KEINE alten Zonen/Bars/Signale."""
-    source = next((p for p in LEGACY_STATE_CANDIDATES if p.exists()), None)
-    if source is None:
-        return []
-    try:
-        s = json.loads(source.read_text(encoding="utf-8"))
-        raw = s.get("days", [])
-        clean = []
-        for d in raw:
-            date = str(d["date"])
-            dt.date.fromisoformat(date)
-            h, l, c = float(d["h"]), float(d["l"]), float(d["c"])
-            if not all(math.isfinite(x) for x in (h, l, c)):
-                continue
-            if l <= 0 or h < l or not (l <= c <= h):
-                continue
-            clean.append({"date": date, "h": h, "l": l, "c": c})
-        by_date = {d["date"]: d for d in clean}
-        out = [by_date[k] for k in sorted(by_date.keys())][-80:]
-        if out:
-            print(f"[MIGRATION] {len(out)} Daily-Zeilen aus {source}")
-        return out
-    except Exception as e:
-        print(f"[MIGRATION ERR] {e}")
-        return []
-
-
-
-def apply_embedded_bootstrap():
-    """Ergaenzt nur fehlende Daily-Zeilen; vorhandene Live-Daten gewinnen."""
-    global days, active_daily
-    by_date = {str(d["date"]): d for d in DAILY_BOOTSTRAP}
-    for d in days:
-        by_date[str(d["date"])] = d
-    days = [by_date[k] for k in sorted(by_date.keys())][-80:]
-
-    if active_daily is None:
-        active_daily = dict(ACTIVE_DAILY_BOOTSTRAP)
-    elif str(active_daily.get("date")) == str(ACTIVE_DAILY_BOOTSTRAP["date"]):
-        # Seed deckt den Export bis last_ts ab; falls State neuer ist, State-Close behalten.
-        boot = ACTIVE_DAILY_BOOTSTRAP
-        active_daily["h"] = max(float(active_daily["h"]), float(boot["h"]))
-        active_daily["l"] = min(float(active_daily["l"]), float(boot["l"]))
-        if float(boot.get("last_ts", 0)) > float(active_daily.get("last_ts", 0)):
-            active_daily["c"] = float(boot["c"])
-            active_daily["last_ts"] = float(boot["last_ts"])
-
-def load_state():
-    global days, active_daily, long_zones, short_zones
-    global bar_num, bars_today, prev_session, current_ct_date
-    global last_bar_ts, signals_today
-
-    if not STATE_FILE.exists():
-        days = import_legacy_days()
-        apply_embedded_bootstrap()
-        save_state()
-        print(f"[STATE] neu | days={len(days)}")
-        return
-
-    try:
-        s = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-
-        bars.clear()
-        bars.extend(s.get("bars", [])[-600:])
-
-        raw_days = s.get("days", [])
-        days = raw_days[-80:] if raw_days else import_legacy_days()
-        active_daily = s.get("active_daily")
-
-        long_zones = [tuple(x) for x in s.get("long_zones", [])]
-        short_zones = [tuple(x) for x in s.get("short_zones", [])]
-
-        bar_num = int(s.get("bar_num", 0))
-        bars_today = int(s.get("bars_today", 0))
-        prev_session = s.get("prev_session")
-        current_ct_date = s.get("current_ct_date")
-        last_bar_ts = s.get("last_bar_ts")
-        signals_today = s.get("signals_today", [])[-200:]
-
-        recent_bar_ts.clear()
-        recent_bar_set.clear()
-        for x in s.get("recent_bar_ts", [])[-2000:]:
-            k = int(x)
-            recent_bar_ts.append(k)
-            recent_bar_set.add(k)
-
-        signal_history.clear()
-        signal_history.extend(s.get("signal_history", [])[-1000:])
-
-        apply_embedded_bootstrap()
-
-        print(
-            f"[STATE] geladen bars={len(bars)} days={len(days)} "
-            f"zones={len(long_zones)}/{len(short_zones)} last_ts={last_bar_ts}"
-        )
-    except Exception as e:
-        raise RuntimeError(f"State-Datei unlesbar: {STATE_FILE}: {e}") from e
-
-
-# ─────────────────────────────────────────────────────────────
-# DAILY DATA / MOMENTUM
-# ─────────────────────────────────────────────────────────────
-def backtest_daily_date(ts):
-    """
-    Custom-Day-Gruppierung aus dem bisherigen robusten Server:
-    date(America/New_York timestamp - 1h).
-    """
-    x = dt.datetime.fromtimestamp(float(ts), tz=ET) - dt.timedelta(hours=1)
-    return x.date().isoformat()
-
-
-def upsert_closed_day(row):
-    global days
-    date = str(row["date"])
-    clean = {
-        "date": date,
-        "h": float(row["h"]),
-        "l": float(row["l"]),
-        "c": float(row["c"]),
-    }
-    by_date = {d["date"]: d for d in days}
-    by_date[date] = clean
-    days = [by_date[k] for k in sorted(by_date.keys())][-80:]
-
-
-def update_daily_from_m5(h, l, c, ts):
-    """
-    Baut den laufenden Custom-Day aus allen eingehenden M5-Bars.
-    Erst beim Wechsel des Daily-Keys wird der vorherige Tag in `days`
-    übernommen. Momentum nutzt damit nur abgeschlossene Tage.
-    """
-    global active_daily
-
-    key = backtest_daily_date(ts)
-    h, l, c, ts = float(h), float(l), float(c), float(ts)
-
-    if active_daily is None:
-        active_daily = {
-            "date": key, "h": h, "l": l, "c": c, "last_ts": ts
-        }
-        return False
-
-    cur = str(active_daily["date"])
-    if key < cur:
-        return False
-
-    if key != cur:
-        upsert_closed_day(active_daily)
-        print(
-            f"[DAILY] final {cur} "
-            f"H:{active_daily['h']:.2f} L:{active_daily['l']:.2f} "
-            f"C:{active_daily['c']:.2f}"
-        )
-        active_daily = {
-            "date": key, "h": h, "l": l, "c": c, "last_ts": ts
-        }
-        return True
-
-    active_daily["h"] = max(float(active_daily["h"]), h)
-    active_daily["l"] = min(float(active_daily["l"]), l)
-    if ts >= float(active_daily.get("last_ts", -1)):
-        active_daily["c"] = c
-        active_daily["last_ts"] = ts
-    return False
-
-
-def momentum():
-    """
-    Live-kausale Fassung:
-    cp = letzter abgeschlossener Daily-Close
-    cn = 20 Daily-Zeilen davor (days[-21])
-    ATR = Mittel H-L der letzten 14 abgeschlossenen Dailys
-    """
-    if len(days) < 21:
-        return None, None, False, False
-
-    cp = float(days[-1]["c"])
-    cn = float(days[-21]["c"])
-    atr_d = sum(float(d["h"]) - float(d["l"]) for d in days[-14:]) / 14.0
-
-    if atr_d <= 0:
-        return None, None, False, False
-
-    mom = abs(cp - cn) / atr_d
-    up = cp > cn
-    return mom, up, mom <= MOM_THRESH, mom > MOM_THRESH
-
-
-# ─────────────────────────────────────────────────────────────
-# M5 ATR
-# ─────────────────────────────────────────────────────────────
-def add_bar(o, h, l, c, v, ts):
-    bars.append({
-        "o": float(o), "h": float(h), "l": float(l),
-        "c": float(c), "v": float(v), "ts": float(ts)
-    })
-
-
-def atr_m5():
-    if len(bars) < ATR_LEN + 1:
-        return None
-
-    b = list(bars)
-    trs = []
-    for i in range(1, len(b)):
-        trs.append(max(
-            b[i]["h"] - b[i]["l"],
-            abs(b[i]["h"] - b[i - 1]["c"]),
-            abs(b[i]["l"] - b[i - 1]["c"]),
-        ))
-    return sum(trs[-ATR_LEN:]) / ATR_LEN
-
-
-# ─────────────────────────────────────────────────────────────
-# ZONE LOCK / SESSION RESET
-# ─────────────────────────────────────────────────────────────
-def zone_tick():
-    global long_zones, short_zones
-    long_zones = [(lv, ex) for lv, ex in long_zones if ex > bar_num]
-    short_zones = [(lv, ex) for lv, ex in short_zones if ex > bar_num]
-
-
-def zone_locked(zones, level):
-    return any(abs(float(lv) - float(level)) <= LEVEL_TOL for lv, _ in zones)
-
-
-def zone_add(zones, level):
-    zones.append((float(level), bar_num + ZONE_BARS))
-
-
-def zone_reset(reason=""):
-    long_zones.clear()
-    short_zones.clear()
-    print(f"[ZONE] reset{': ' + reason if reason else ''}")
-
-
-def check_new_ct_day(ts):
-    global current_ct_date, bars_today, signals_today, prev_session
-
-    d = ct_date_str(ts)
-    if current_ct_date is None:
-        current_ct_date = d
-        bars_today = 0
-        return
-
-    if d != current_ct_date:
-        print(f"[DAY] {current_ct_date} -> {d}")
-        current_ct_date = d
-        bars_today = 0
-        signals_today = []
-        zone_reset("new CT day")
-        # Wichtig: Damit der erste Eintritt in EU des neuen Tages
-        # sicher wieder als Sessionwechsel erkannt wird.
-        prev_session = None
-
-
-def apply_session_reset(ts):
-    """
-    Reset beim EINTRITT in EU und beim Wechsel EU -> US.
-    Außerhalb einer Session bleibt prev_session unverändert.
-    """
-    global prev_session
-
-    curr = session_code(ts)
-    if curr is not None and curr != prev_session:
-        old = prev_session
-        zone_reset(f"session {old} -> {curr}")
-        prev_session = curr
-
-
-# ─────────────────────────────────────────────────────────────
-# SIGNAL ENGINE
-# ─────────────────────────────────────────────────────────────
-def make_signal(system, direction, params, entry, stop):
-    risk = (entry - stop) if direction == "LONG" else (stop - entry)
-    ticks = round(risk / TICK)
-
-    if not (0 < risk <= MAX_RISK and ticks <= params["MAX_TICKS"]):
-        return None
-
-    target = (
-        entry + risk * params["CRV"]
-        if direction == "LONG"
-        else entry - risk * params["CRV"]
-    )
-
-    return {
-        "system": system,
-        "dir": direction,
-        "entry": r2(entry),
-        "stop": r2(stop),
-        "target": r2(target),
-        "raw_risk": float(risk),
-        "ticks": int(ticks),
-        "crv": float(params["CRV"]),
-        "mm": float(params["MM"]),
-        "sb": float(params["SB"]),
-        "lookback": int(params["LOOKBACK"]),
-        "max_ticks": int(params["MAX_TICKS"]),
-    }
-
-
-def scan_direction(system, direction, params, close):
-    """
-    Referenz-Semantik:
-    - k = 2..LOOKBACK
-    - erstes Sweep/Reclaim-Muster besitzt den Scan
-    - sobald die Pattern-Bedingung erfüllt ist, wird IMMER abgebrochen,
-      auch wenn Risk/MaxTicks ungültig oder das Level gesperrt ist.
-    """
-    b = list(bars)
-    zones = long_zones if direction == "LONG" else short_zones
-
-    for k in range(2, params["LOOKBACK"] + 1):
-        i_liq = -(k + 2)
-        i_extr = -(k + 1)
-
-        if abs(i_liq) > len(b):
-            break
-
-        if direction == "LONG":
-            liq = float(b[i_liq]["l"])
-            extr = float(b[i_extr]["l"])
-            pattern = extr < liq and close >= liq + params["MM"]
-            stop = extr - params["SB"]
-        else:
-            liq = float(b[i_liq]["h"])
-            extr = float(b[i_extr]["h"])
-            pattern = extr > liq and close <= liq - params["MM"]
-            stop = extr + params["SB"]
-
-        if not pattern:
-            continue
-
-        sig = make_signal(system, direction, params, liq, stop)
-
-        if sig is not None and not zone_locked(zones, liq):
-            zone_add(zones, liq)
-            return sig
-
-        # Entscheidend: erstes qualifying Pattern beendet den Scan.
-        break
-
-    return None
-
-
-def find_signals(s1_active, s2_active, trend_up, atr):
-    if atr is None or atr > ATR_MAX:
-        return []
-
-    b = list(bars)
-    if len(b) < MAX_LOOKBACK + 3:
-        return []
-
-    close = float(b[-1]["c"])
-    out = []
-
-    if s1_active:
-        a = scan_direction("S1", "LONG", S1, close)
-        b_sig = scan_direction("S1", "SHORT", S1, close)
-        if a:
-            out.append(a)
-        if b_sig:
-            out.append(b_sig)
-
-    if s2_active:
-        direction = "LONG" if trend_up else "SHORT"
-        s = scan_direction("S2", direction, S2, close)
-        if s:
-            out.append(s)
-
-    return out
-
-
-# ─────────────────────────────────────────────────────────────
-# TELEGRAM
-# ─────────────────────────────────────────────────────────────
-def tg(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[TG OFF] {msg[:200]}")
-        return False
-
-    try:
-        body = json.dumps({
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg,
-            "parse_mode": "HTML",
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data=body,
-            headers={"Content-Type": "application/json"},
-        )
-
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status == 200
-    except Exception as e:
-        print(f"[TG ERR] {e}")
-        return False
-
-
-def signal_id(ts, sig):
-    raw = (
-        f"{int(ts)}|{sig['system']}|{sig['dir']}|"
-        f"{sig['entry']:.2f}|{sig['stop']:.2f}|{sig['target']:.2f}"
-    )
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
-
-
-def format_signal(sig, mom, atr, sess, ts):
-    local = dt.datetime.fromtimestamp(ts, tz=CET)
-    em = "🟢" if sig["dir"] == "LONG" else "🔴"
-    ar = "▲" if sig["dir"] == "LONG" else "▼"
-    name = "1 (Seitwärts)" if sig["system"] == "S1" else "2 (Trend)"
-
-    risk_dollars = sig["ticks"] * 10
-    reward_ticks = abs(sig["target"] - sig["entry"]) / TICK
-    reward_dollars = round(reward_ticks * 10)
-    sid = signal_id(ts, sig)
-
-    return (
-        f"{em} <b>System {name} | {sig['dir']} {ar}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📍 Entry:  <b>${sig['entry']:.2f}</b>\n"
-        f"🛑 Stop:   <b>${sig['stop']:.2f}</b>  "
-        f"(-{sig['ticks']}T / -${risk_dollars})\n"
-        f"🎯 Target: <b>${sig['target']:.2f}</b>  "
-        f"(+{reward_ticks:.0f}T / +${reward_dollars})\n"
-        f"📊 CRV 1:{sig['crv']:.1f} | ATR-Mom:{mom:.1f}× | ATR:${atr:.3f}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 {local.strftime('%Y-%m-%d %H:%M %Z')} | {sess} | CL M5\n"
-        f"ID: <code>{sid}</code>"
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-# ENDPOINTS
-# ─────────────────────────────────────────────────────────────
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    global bar_num, bars_today, last_bar_ts
-
-    with LOCK:
-        try:
-            d = parse_json_body()
-
-            if not authorized(d):
-                return jsonify({"status": "error", "msg": "unauthorized"}), 401
-            o = get_price(d, "o", "open")
-            h = get_price(d, "h", "high")
-            l = get_price(d, "l", "low")
-            c = get_price(d, "c", "close")
-            v = float(d.get("v", d.get("volume", 0)) or 0)
-            ts = parse_timestamp(d.get("t", d.get("time")))
-
-            validate_ohlcv(o, h, l, c, v)
-
-            ts_key = int(round(ts))
-            if ts_key in recent_bar_set:
-                return jsonify({
-                    "status": "ok",
-                    "msg": "duplicate bar ignored",
-                    "ts": ts_key,
-                }), 200
-
-            if last_bar_ts is not None and ts <= float(last_bar_ts):
-                return jsonify({
-                    "status": "ok",
-                    "msg": "out-of-order bar ignored",
-                    "ts": ts,
-                    "last_bar_ts": last_bar_ts,
-                }), 200
-
-            # Daily-Aufbau bekommt ALLE M5-Bars, auch Weekend/Sonntag.
-            update_daily_from_m5(h, l, c, ts)
-
-            if not remember_ts(ts):
-                return jsonify({
-                    "status": "ok",
-                    "msg": "duplicate bar ignored",
-                    "ts": ts_key,
-                }), 200
-
-            last_bar_ts = ts
-
-            # Signal-M5-Puffer wie bisher nur CT-Wochentage.
-            if not weekday_ct(ts):
-                save_state()
-                return jsonify({
-                    "status": "ok",
-                    "msg": "weekend daily-only",
-                    "daily_key": backtest_daily_date(ts),
-                }), 200
-
-            check_new_ct_day(ts)
-
-            add_bar(o, h, l, c, v, ts)
-            bar_num += 1
-            bars_today += 1
-
-            zone_tick()
-            apply_session_reset(ts)
-
-            mom, up, s1_active, s2_active = momentum()
-            atr = atr_m5()
-            sess = session_label(ts)
-
-            if mom is None:
-                save_state()
-                return jsonify({
-                    "status": "ok",
-                    "msg": f"daily warming up ({len(days)} closed days)",
-                }), 200
-
-            if atr is None:
-                save_state()
-                return jsonify({
-                    "status": "ok",
-                    "msg": "M5 ATR warming up",
-                }), 200
-
-            if not in_any_session(ts):
-                save_state()
-                return jsonify({
-                    "status": "ok",
-                    "msg": "pre/post-session buffer only",
-                    "mom_atr": round(mom, 4),
-                    "atr_m5": round(atr, 4),
-                }), 200
-
-            signals = find_signals(s1_active, s2_active, up, atr)
-            sent = []
-
-            for sig in signals:
-                sid = signal_id(ts, sig)
-                telegram_ok = tg(format_signal(sig, mom, atr, sess, ts))
-
-                record = {
-                    "signal_id": sid,
-                    "bar_ts": int(ts),
-                    "time_berlin": dt.datetime.fromtimestamp(ts, tz=CET).isoformat(),
-                    "time_ct": dt.datetime.fromtimestamp(ts, tz=CT).isoformat(),
-                    "system": sig["system"],
-                    "dir": sig["dir"],
-                    "entry": sig["entry"],
-                    "stop": sig["stop"],
-                    "target": sig["target"],
-                    "raw_risk": sig["raw_risk"],
-                    "ticks": sig["ticks"],
-                    "crv": sig["crv"],
-                    "session": sess,
-                    "mom_atr": mom,
-                    "atr_m5": atr,
-                    "telegram_sent": telegram_ok,
-                }
-
-                signals_today.append(record)
-                signal_history.append(record)
-                sent.append(record)
-
-                print(
-                    f"[SIG] {sid} | {sess} | "
-                    f"{sig['system']} {sig['dir']} @{sig['entry']:.2f}"
-                )
-
-            save_state()
-
-            return jsonify({
-                "status": "ok",
-                "version": VERSION,
-                "bar_ts": int(ts),
-                "session": sess,
-                "mom_atr": round(mom, 4),
-                "atr_m5": round(atr, 4),
-                "system": "S1" if s1_active else "S2",
-                "trend": "up" if up else "down",
-                "signals": sent,
-                "zone_lock": {
-                    "long": [
-                        {"level": round(lv, 2), "expire_bar": ex}
-                        for lv, ex in long_zones
-                    ],
-                    "short": [
-                        {"level": round(lv, 2), "expire_bar": ex}
-                        for lv, ex in short_zones
-                    ],
-                },
-            }), 200
-
-        except ValueError as e:
-            return jsonify({"status": "error", "msg": str(e)}), 400
-        except Exception as e:
-            print(f"[ERR] {type(e).__name__}: {e}")
-            return jsonify({"status": "error", "msg": str(e)}), 500
-
-
-@app.route("/daily", methods=["POST"])
-def daily_disabled():
-    # Daily wird aus M5 gebaut, damit die Gruppierung deterministisch bleibt.
-    return jsonify({
-        "status": "disabled",
-        "msg": "Daily wird automatisch aus M5 aufgebaut; D1-Alarm deaktiviert lassen.",
-    }), 409
-
-
-@app.route("/status", methods=["GET"])
-def status():
-    with LOCK:
-        mom, up, s1_active, s2_active = momentum()
-        now = dt.datetime.now(CET)
-
-        return jsonify({
-            "status": "online",
-            "version": VERSION,
-            "time_berlin": now.isoformat(),
-            "state_file": str(STATE_FILE),
-            "legacy_state_file": str(LEGACY_STATE_FILE),
-            "strategy": {
-                "S1": S1,
-                "S2": S2,
-                "atr_max": ATR_MAX,
-                "atr_len": ATR_LEN,
-                "mom_thresh": MOM_THRESH,
-                "mom_window": MOM_WINDOW,
-                "zone_bars": ZONE_BARS,
-                "level_tol": LEVEL_TOL,
-                "sessions_ct": {
-                    "eu": "02:00 <= t < 08:30",
-                    "us": "08:30 <= t <= 14:00",
-                },
-                "zone_reset": "new CT day + EU entry + EU->US",
-                "target_formula": "round(entry +/- raw_risk*crv, 2)",
-                "daily_mode": "closed-days-only (live causal)",
-            },
-            "runtime": {
-                "current_ct_date": current_ct_date,
-                "bars_today": bars_today,
-                "bars_buffer": len(bars),
-                "bar_num": bar_num,
-                "last_bar_ts": last_bar_ts,
-                "last_bar_utc": (
-                    dt.datetime.fromtimestamp(last_bar_ts, tz=UTC).isoformat()
-                    if last_bar_ts else None
-                ),
-                "prev_session": prev_session,
-            },
-            "daily": {
-                "closed_days": len(days),
-                "last_closed_day": days[-1]["date"] if days else None,
-                "active_day": active_daily,
-                "mom_atr": round(mom, 4) if mom is not None else None,
-                "system": (
-                    "S1" if s1_active else ("S2" if s2_active else None)
-                ),
-                "trend": (
-                    "up" if up is True else ("down" if up is False else None)
-                ),
-            },
-            "zones": {
-                "long": [
-                    {"level": round(lv, 2), "expire_bar": ex}
-                    for lv, ex in long_zones
-                ],
-                "short": [
-                    {"level": round(lv, 2), "expire_bar": ex}
-                    for lv, ex in short_zones
-                ],
-            },
-            "signals_today": signals_today[-20:],
-        }), 200
-
-
-@app.route("/reset", methods=["POST"])
-def reset():
-    global signals_today, prev_session
-
-    with LOCK:
-        if not authorized():
-            return jsonify({"status": "error", "msg": "unauthorized"}), 401
-
-        signals_today = []
-        zone_reset("manual")
-        # Session-State bewusst nicht auf None setzen:
-        # ein manueller Reset innerhalb der laufenden Session soll nicht
-        # beim nächsten M5-Bar nochmals automatisch resetten.
-        save_state()
-
-        return jsonify({
-            "status": "ok",
-            "msg": "signal day stats + zones reset",
-        }), 200
-
-
-@app.route("/test", methods=["GET"])
-def test():
-    ok = tg(
-        "🧪 <b>CL v7.0 FINAL</b> — Server online\n"
-        "S1 0.6R | S2 0.7R | EU + US"
-    )
-    return jsonify({"status": "ok", "telegram": bool(ok)}), 200
-
-
-@app.route("/health", methods=["GET"])
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({
-        "status": "online",
-        "version": VERSION,
-    }), 200
-
-
-load_state()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+TICK_VALUE = 10.0
+ROUND_TRIP_FEE = 7.20
+BERLIN = ZoneInfo("Europe/Berlin")
+NY = ZoneInfo("America/New_York")
+
+# CP015/CP016 retained + CP017 combined daily cap
+MAX_COMBINED_TRADES_PER_BERLIN_DAY = 4
+MAX_S3_TRADES_PER_BERLIN_DAY = 2
+S2_MAX_REALIZED_LOSSES_PER_DAY = 4
+PRIORITY = {"C_MOM_CONT": 0, "D_RANGE_FAIL": 1, "B_DIR_SWEEP": 2, "A_DIR_BREAK": 3}
+APEX_DAILY_RISK_BUDGET = 1500.0
+STOP_RISK = {"HV-1":157.20,"HV-2":157.20,"LV-1":87.20,"LV-2":87.20,"LV-3":87.20,
+             "A_DIR_BREAK":807.20,"C_MOM_CONT":607.20,"D_RANGE_FAIL":1007.20}
+def apex_risk_gate(realized_day_pnl: float, setup: str) -> bool:
+    return realized_day_pnl - STOP_RISK[setup] >= -APEX_DAILY_RISK_BUDGET - 1e-9
+
+
+@dataclass(frozen=True)
+class Signal:
+    setup: str
+    direction: int   # +1 long, -1 short
+    signal_close_et: datetime
+    entry_eligible_berlin: datetime
