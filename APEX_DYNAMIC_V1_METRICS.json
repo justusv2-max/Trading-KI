@@ -1,0 +1,42 @@
+{
+  "source_master": "S2_S3_ABCD_COMBINED_TRADES_CHRONO.csv",
+  "base_budget": 1200,
+  "profit_credit": 0.6,
+  "effective_budget_cap": 1400,
+  "dd_threshold_1": -1000,
+  "cut_1": 200,
+  "dd_threshold_2": -1800,
+  "cut_2": 450,
+  "max_trades_day": 9,
+  "risk_map": {
+    "S2_HV-1": 157.2,
+    "S2_HV-2": 157.2,
+    "S2_LV-1": 87.2,
+    "S2_LV-2": 87.2,
+    "S2_LV-3": 87.2,
+    "S3_A": 1827.2,
+    "S3_B": 807.2,
+    "S3_C": 1007.2,
+    "S3_D": 1407.2
+  },
+  "trades": 7067,
+  "blocked": 1275,
+  "net": 156807.6009918219,
+  "daily_close_maxdd": -2497.199084472668,
+  "worst_day": -1178.8,
+  "days_below_minus_1400": 0,
+  "positive_years": 11,
+  "years": 11,
+  "positive_months": 101,
+  "months": 128,
+  "setup_counts": {
+    "S2_HV-1": 2429,
+    "S2_LV-1": 2156,
+    "S2_LV-2": 786,
+    "S2_LV-3": 536,
+    "S2_HV-2": 437,
+    "S3_B": 412,
+    "S3_C": 235,
+    "S3_D": 76
+  }
+}

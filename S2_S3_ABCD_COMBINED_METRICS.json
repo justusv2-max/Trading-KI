@@ -1,0 +1,33 @@
+{
+  "status": "FINAL_COMBINED_RESEARCH_REPLAY_SIMULTANEOUS_SUBSYSTEM_POSITIONS_ALLOWED",
+  "trades": 8342,
+  "s2_trades": 6542,
+  "s3_trades": 1800,
+  "net": 225467.58821258627,
+  "pf_trade_aggregate": 1.365347883564646,
+  "daily_close_maxdd": -6777.206408691418,
+  "worst_day": -2859.206408691417,
+  "best_day": 2613.600000000017,
+  "positive_years": 11,
+  "years_total": 11,
+  "positive_months": 109,
+  "months_total": 128,
+  "s2_s3_daily_corr": -0.003283689229168883,
+  "s2_active_days": 2233,
+  "s3_active_days": 893,
+  "both_active_days": 670,
+  "entry_order_dd_diagnostic_not_exit_order": -7892.006408691232,
+  "yearly": {
+    "2016": 5313.593286132838,
+    "2017": 2801.200610351599,
+    "2018": 22525.989929199157,
+    "2019": 13024.791455078188,
+    "2020": 21496.403623962415,
+    "2021": 16274.800915527343,
+    "2022": 46183.59511718788,
+    "2023": 28667.20213623061,
+    "2024": 20196.4051879883,
+    "2025": 23881.998626708875,
+    "2026": 25101.607324219116
+  }
+}

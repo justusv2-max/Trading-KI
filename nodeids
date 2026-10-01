@@ -1,0 +1,6 @@
+[
+  "tests/test_engine.py::test_session_roll",
+  "tests/test_engine.py::test_va_and_context",
+  "tests/test_modes.py::test_apex_blocks_a_and_caps_trade_count",
+  "tests/test_modes.py::test_ek_bypasses_apex_gate"
+]
