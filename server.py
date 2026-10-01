@@ -274,10 +274,7 @@ def bar(
 
     if old:
         c.close()
-
-        return json.loads(
-            old[0]
-        )
+        return json.loads(old[0])
 
     c.close()
 
@@ -322,9 +319,7 @@ def bar(
     c.commit()
     c.close()
 
-    telegram(
-        r["events"]
-    )
+    telegram(r["events"])
 
     return r
 
@@ -346,7 +341,6 @@ def bootstrap(
         e.ingest(
             b.model_dump()
         )
-
         n += 1
 
     save(e)
@@ -412,14 +406,9 @@ def tradingview(
             "timeframe must be 1 or 5",
         )
 
-    # M5 live alerts are accepted as
-    # heartbeat/audit only.
-    #
-    # Strategy execution is driven by M1,
-    # matching the frozen engine.
-    #
-    # M30 is causally aggregated from
-    # completed M1 bars.
+    # M5 live alerts are accepted as heartbeat/audit only.
+    # Strategy execution is driven by M1, matching the frozen engine.
+    # M30 is causally aggregated from completed M1 bars.
 
     if tf == "5":
         c = conn()
@@ -453,58 +442,35 @@ def tradingview(
         }
 
     bb = Bar(
-        event_id=
-            b.event_id,
-
-        timestamp=
-            b.timestamp,
-
-        open=
-            b.open,
-
-        high=
-            b.high,
-
-        low=
-            b.low,
-
-        close=
-            b.close,
-
-        volume=
-            b.volume,
-
+        event_id=b.event_id,
+        timestamp=b.timestamp,
+        open=b.open,
+        high=b.high,
+        low=b.low,
+        close=b.close,
+        volume=b.volume,
         timeframe="1",
     )
 
     return bar(
         bb,
-        SECRET
-        if SECRET
-        else None,
+        SECRET if SECRET else None,
     )
 
 
 # --------------------------------------------------
 # TELEGRAM TEST
-# Does NOT send a bar into the engine.
+# Public test endpoint.
+# Sends only a fixed Telegram message.
+# Does NOT ingest a bar.
 # Does NOT create a trade.
-# Does NOT modify Apex PnL or trading state.
+# Does NOT modify Apex PnL or engine state.
 # --------------------------------------------------
 
 @app.get("/telegram-test")
-def telegram_test(
-    x_webhook_secret:
-        str | None = Header(None)
-):
-    auth(
-        x_webhook_secret
-    )
+def telegram_test():
 
-    if not (
-        TOKEN
-        and CHAT
-    ):
+    if not (TOKEN and CHAT):
         raise HTTPException(
             500,
             "Telegram not configured",
@@ -519,14 +485,12 @@ def telegram_test(
         req = urllib.request.Request(
             f"https://api.telegram.org/"
             f"bot{TOKEN}/sendMessage",
-
             json.dumps(
                 {
                     "chat_id": CHAT,
                     "text": text,
                 }
             ).encode(),
-
             {
                 "Content-Type":
                     "application/json"
