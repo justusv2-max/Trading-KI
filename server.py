@@ -15,7 +15,7 @@ DB = os.getenv("STATE_DB", "/data/master.sqlite3")
 MODE = os.getenv("TRADING_MODE", "APEX").upper()
 SECRET = os.getenv("WEBHOOK_SECRET", "")
 
-# Railway variables
+# Railway Telegram variables
 TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -25,24 +25,29 @@ Path(DB).parent.mkdir(parents=True, exist_ok=True)
 
 def conn():
     c = sqlite3.connect(DB)
+
     c.execute(
         "CREATE TABLE IF NOT EXISTS kv("
         "k TEXT PRIMARY KEY,"
         "v BLOB)"
     )
+
     c.execute(
         "CREATE TABLE IF NOT EXISTS events("
         "id TEXT PRIMARY KEY,"
         "reply TEXT)"
     )
+
     return c
 
 
 def load():
     c = conn()
+
     r = c.execute(
         "SELECT v FROM kv WHERE k='engine'"
     ).fetchone()
+
     c.close()
 
     if r:
@@ -50,13 +55,16 @@ def load():
 
     elif Path(__file__).with_name("seed_state.pkl").exists():
         e = pickle.loads(
-            Path(__file__).with_name("seed_state.pkl").read_bytes()
+            Path(__file__).with_name(
+                "seed_state.pkl"
+            ).read_bytes()
         )
 
     else:
         e = Engine()
 
     e.set_mode(MODE)
+
     return e
 
 
@@ -64,7 +72,8 @@ def save(e):
     c = conn()
 
     c.execute(
-        "INSERT OR REPLACE INTO kv(k,v) VALUES('engine',?)",
+        "INSERT OR REPLACE INTO kv(k,v) "
+        "VALUES('engine',?)",
         (pickle.dumps(e),),
     )
 
@@ -74,7 +83,10 @@ def save(e):
 
 def auth(x):
     if SECRET and x != SECRET:
-        raise HTTPException(401, "bad secret")
+        raise HTTPException(
+            401,
+            "bad secret"
+        )
 
 
 def telegram(events):
@@ -100,15 +112,19 @@ def telegram(events):
         )
 
         text = (
-            f"CL MASTER | {e.get('setup', '')} | "
+            f"CL MASTER | "
+            f"{e.get('setup', '')} | "
             f"{e['kind']} {d}\n"
-            + json.dumps(e, ensure_ascii=False)
+            + json.dumps(
+                e,
+                ensure_ascii=False
+            )
         )
 
         try:
-
             req = urllib.request.Request(
-                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                f"https://api.telegram.org/"
+                f"bot{TOKEN}/sendMessage",
                 json.dumps(
                     {
                         "chat_id": CHAT,
@@ -116,7 +132,8 @@ def telegram(events):
                     }
                 ).encode(),
                 {
-                    "Content-Type": "application/json"
+                    "Content-Type":
+                    "application/json"
                 },
             )
 
@@ -165,7 +182,6 @@ app = FastAPI(
 
 @app.get("/health")
 def health():
-
     e = load()
 
     ready = (
@@ -177,72 +193,103 @@ def health():
         "ok": True,
         "ready": ready,
         "last_bar": e.last_ts,
-        "completed_sessions": len(e.completed_sessions),
-        "telegram": bool(TOKEN and CHAT),
+        "completed_sessions":
+            len(e.completed_sessions),
+        "telegram":
+            bool(TOKEN and CHAT),
         "mode": MODE,
-        "execution": "SIGNAL_ONLY_PAPER_RECONCILIATION",
-        "master": "S2+S3 A/B/C/D 2026-09-30",
+        "execution":
+            "SIGNAL_ONLY_PAPER_RECONCILIATION",
+        "master":
+            "S2+S3 A/B/C/D 2026-09-30",
     }
 
 
 @app.get("/state")
 def state(
-    x_webhook_secret: str | None = Header(None)
+    x_webhook_secret:
+        str | None = Header(None)
 ):
-
     auth(x_webhook_secret)
 
     e = load()
 
     return {
-        "last_bar": e.last_ts,
-        "completed_sessions": len(e.completed_sessions),
-        "pending_s2": len(e.pending_limits),
-        "pending_s3": len(e.s3_pending),
-        "paper_positions": [
-            p.__dict__ for p in e.positions
-        ],
-        "trading_mode": e.mode,
-        "risk_day": e.risk_day,
-        "risk_day_realized": e.risk_day_realized,
-        "risk_day_trades": e.risk_day_trades,
-        "risk_start_dd": e.risk_start_dd,
-        "risk_base_budget": e.risk_base_budget,
-        "risk_effective_budget": e._risk_effective_budget(),
+        "last_bar":
+            e.last_ts,
+
+        "completed_sessions":
+            len(e.completed_sessions),
+
+        "pending_s2":
+            len(e.pending_limits),
+
+        "pending_s3":
+            len(e.s3_pending),
+
+        "paper_positions":
+            [
+                p.__dict__
+                for p in e.positions
+            ],
+
+        "trading_mode":
+            e.mode,
+
+        "risk_day":
+            e.risk_day,
+
+        "risk_day_realized":
+            e.risk_day_realized,
+
+        "risk_day_trades":
+            e.risk_day_trades,
+
+        "risk_start_dd":
+            e.risk_start_dd,
+
+        "risk_base_budget":
+            e.risk_base_budget,
+
+        "risk_effective_budget":
+            e._risk_effective_budget(),
     }
 
 
 @app.post("/bar")
 def bar(
     b: Bar,
-    x_webhook_secret: str | None = Header(None),
+    x_webhook_secret:
+        str | None = Header(None),
 ):
-
     auth(x_webhook_secret)
 
     c = conn()
 
     old = c.execute(
-        "SELECT reply FROM events WHERE id=?",
+        "SELECT reply FROM events "
+        "WHERE id=?",
         (b.event_id,),
     ).fetchone()
 
     if old:
         c.close()
-        return json.loads(old[0])
+
+        return json.loads(
+            old[0]
+        )
 
     c.close()
 
     e = load()
 
     try:
-
         r = e.ingest(
             {
                 k: v
-                for k, v in b.model_dump().items()
-                if k
-                in {
+                for k, v
+                in b.model_dump().items()
+                if k in {
                     "timestamp",
                     "open",
                     "high",
@@ -264,7 +311,8 @@ def bar(
     c = conn()
 
     c.execute(
-        "INSERT INTO events(id,reply) VALUES(?,?)",
+        "INSERT INTO events"
+        "(id,reply) VALUES(?,?)",
         (
             b.event_id,
             json.dumps(r),
@@ -274,7 +322,9 @@ def bar(
     c.commit()
     c.close()
 
-    telegram(r["events"])
+    telegram(
+        r["events"]
+    )
 
     return r
 
@@ -282,9 +332,9 @@ def bar(
 @app.post("/bootstrap")
 def bootstrap(
     req: Bootstrap,
-    x_webhook_secret: str | None = Header(None),
+    x_webhook_secret:
+        str | None = Header(None),
 ):
-
     auth(x_webhook_secret)
 
     e = Engine()
@@ -293,7 +343,10 @@ def bootstrap(
     n = 0
 
     for b in req.bars:
-        e.ingest(b.model_dump())
+        e.ingest(
+            b.model_dump()
+        )
+
         n += 1
 
     save(e)
@@ -301,18 +354,23 @@ def bootstrap(
     return {
         "ok": True,
         "bars": n,
-        "last_bar": e.last_ts,
-        "completed_sessions": len(e.completed_sessions),
-        "ready": len(e.completed_sessions) >= 5,
+        "last_bar":
+            e.last_ts,
+        "completed_sessions":
+            len(e.completed_sessions),
+        "ready":
+            len(e.completed_sessions) >= 5,
     }
 
 
 @app.post("/reset")
 def reset(
-    x_webhook_secret: str | None = Header(None)
+    x_webhook_secret:
+        str | None = Header(None)
 ):
-
-    auth(x_webhook_secret)
+    auth(
+        x_webhook_secret
+    )
 
     e = Engine()
     e.set_mode(MODE)
@@ -327,9 +385,13 @@ def reset(
 
 
 @app.post("/tv")
-def tradingview(b: TVBar):
-
-    if SECRET and b.secret != SECRET:
+def tradingview(
+    b: TVBar
+):
+    if (
+        SECRET
+        and b.secret != SECRET
+    ):
         raise HTTPException(
             401,
             "bad secret",
@@ -341,28 +403,37 @@ def tradingview(b: TVBar):
         .replace("M", "")
     )
 
-    if tf not in {"1", "5"}:
+    if tf not in {
+        "1",
+        "5",
+    }:
         raise HTTPException(
             400,
             "timeframe must be 1 or 5",
         )
 
-    # M5 live alerts are accepted as heartbeat/audit only.
-    # Strategy execution is driven by M1, matching the
-    # frozen engine. M30 is causally aggregated from
+    # M5 live alerts are accepted as
+    # heartbeat/audit only.
+    #
+    # Strategy execution is driven by M1,
+    # matching the frozen engine.
+    #
+    # M30 is causally aggregated from
     # completed M1 bars.
-    if tf == "5":
 
+    if tf == "5":
         c = conn()
 
         c.execute(
-            "CREATE TABLE IF NOT EXISTS tv_m5("
+            "CREATE TABLE IF NOT EXISTS "
+            "tv_m5("
             "event_id TEXT PRIMARY KEY,"
             "payload TEXT)"
         )
 
         c.execute(
-            "INSERT OR IGNORE INTO tv_m5(event_id,payload) "
+            "INSERT OR IGNORE INTO "
+            "tv_m5(event_id,payload) "
             "VALUES(?,?)",
             (
                 b.event_id,
@@ -375,22 +446,106 @@ def tradingview(b: TVBar):
 
         return {
             "ok": True,
-            "accepted": "M5_AUDIT",
-            "event_id": b.event_id,
+            "accepted":
+                "M5_AUDIT",
+            "event_id":
+                b.event_id,
         }
 
     bb = Bar(
-        event_id=b.event_id,
-        timestamp=b.timestamp,
-        open=b.open,
-        high=b.high,
-        low=b.low,
-        close=b.close,
-        volume=b.volume,
+        event_id=
+            b.event_id,
+
+        timestamp=
+            b.timestamp,
+
+        open=
+            b.open,
+
+        high=
+            b.high,
+
+        low=
+            b.low,
+
+        close=
+            b.close,
+
+        volume=
+            b.volume,
+
         timeframe="1",
     )
 
     return bar(
         bb,
-        SECRET if SECRET else None,
+        SECRET
+        if SECRET
+        else None,
     )
+
+
+# --------------------------------------------------
+# TELEGRAM TEST
+# Does NOT send a bar into the engine.
+# Does NOT create a trade.
+# Does NOT modify Apex PnL or trading state.
+# --------------------------------------------------
+
+@app.get("/telegram-test")
+def telegram_test(
+    x_webhook_secret:
+        str | None = Header(None)
+):
+    auth(
+        x_webhook_secret
+    )
+
+    if not (
+        TOKEN
+        and CHAT
+    ):
+        raise HTTPException(
+            500,
+            "Telegram not configured",
+        )
+
+    text = (
+        "✅ CL MASTER TEST\n"
+        "Railway → Telegram funktioniert."
+    )
+
+    try:
+        req = urllib.request.Request(
+            f"https://api.telegram.org/"
+            f"bot{TOKEN}/sendMessage",
+
+            json.dumps(
+                {
+                    "chat_id": CHAT,
+                    "text": text,
+                }
+            ).encode(),
+
+            {
+                "Content-Type":
+                    "application/json"
+            },
+        )
+
+        urllib.request.urlopen(
+            req,
+            timeout=4,
+        ).read()
+
+        return {
+            "ok": True,
+            "telegram_sent": True,
+            "trading_state_changed": False,
+        }
+
+    except Exception as ex:
+        raise HTTPException(
+            500,
+            f"Telegram error: {ex}",
+        )
