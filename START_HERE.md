@@ -1,3 +1,6 @@
+# CURRENT LIVE OVERRIDE — 2026-10-03
+Read APEX_WEEKEND_2026_10_03_CHECKPOINT.md first. Current live input is M1-only; M5 live webhook is not required. Current APEX protection uses the $825 preventive gate and max 9 approved entries/day.
+
 # START HERE — AUTHORITATIVE RECOVERY POINT
 
 Frozen live/recovery point: 2026-10-01.

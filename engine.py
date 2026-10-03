@@ -68,7 +68,7 @@ class Engine:
     last_ts:str|None=None
     mode:str='APEX'
     risk_day:str|None=None; risk_day_realized:float=0.0; risk_day_trades:int=0
-    risk_equity:float=0.0; risk_peak:float=0.0; risk_start_dd:float=0.0; risk_base_budget:float=1200.0
+    risk_equity:float=0.0; risk_peak:float=0.0; risk_start_dd:float=0.0; risk_base_budget:float=825.0
 
 
     RISK_MAP={'HV-1':157.2,'HV-2':157.2,'LV-1':87.2,'LV-2':87.2,'LV-3':87.2,'S3-A':1827.2,'S3-B':807.2,'S3-C':1007.2,'S3-D':1407.2}
@@ -83,11 +83,10 @@ class Engine:
             self.risk_equity += self.risk_day_realized; self.risk_peak=max(self.risk_peak,self.risk_equity)
             self.risk_day=d; self.risk_day_realized=0.0; self.risk_day_trades=0; self.risk_start_dd=self.risk_equity-self.risk_peak; self._risk_set_base()
     def _risk_set_base(self):
-        b=1200.0
-        if self.risk_start_dd<=-1000: b-=200.0
-        if self.risk_start_dd<=-1800: b-=450.0
-        self.risk_base_budget=b
-    def _risk_effective_budget(self): return min(self.risk_base_budget+0.60*max(self.risk_day_realized,0.0),1400.0)
+        # APEX protection phase: fixed preventive budget.
+        # This is intentionally conservative while the account buffer is small.
+        self.risk_base_budget=825.0
+    def _risk_effective_budget(self): return 825.0
     def _risk_allow(self,setup):
         if self.mode=='EK': return True,'EK_UNLIMITED'
         if self.risk_day_trades>=9:return False,'APEX_MAX_9_TRADES'

@@ -1,11 +1,12 @@
 //@version=6
-indicator("CL Railway Bar Sender v1", overlay=false)
+indicator("CL Railway M1 Sender APEX", overlay=false)
 
+// Live strategy input is M1 only. M5 is NOT required live.
 // Put the same secret in Railway WEBHOOK_SECRET and here.
 secret = input.string("CHANGE_ME", "Webhook secret")
+isM1 = timeframe.isminutes and timeframe.multiplier == 1
 
-if barstate.isconfirmed
-    tf = timeframe.period
-    eventId = syminfo.tickerid + "-" + tf + "-" + str.tostring(time)
-    payload = '{"secret":"' + secret + '","event_id":"' + eventId + '","timeframe":"' + tf + '","timestamp":"' + str.format_time(time, "yyyy-MM-dd''T''HH:mm:ssXXX", "UTC") + '","open":' + str.tostring(open) + ',"high":' + str.tostring(high) + ',"low":' + str.tostring(low) + ',"close":' + str.tostring(close) + ',"volume":' + str.tostring(volume) + '}'
+if barstate.isconfirmed and isM1
+    eventId = syminfo.tickerid + "-1-" + str.tostring(time)
+    payload = '{"secret":"' + secret + '","event_id":"' + eventId + '","timeframe":"1","timestamp":"' + str.format_time(time, "yyyy-MM-dd''T''HH:mm:ssXXX", "UTC") + '","open":' + str.tostring(open) + ',"high":' + str.tostring(high) + ',"low":' + str.tostring(low) + ',"close":' + str.tostring(close) + ',"volume":' + str.tostring(volume) + '}'
     alert(payload, alert.freq_once_per_bar_close)
