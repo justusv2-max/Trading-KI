@@ -1,0 +1,14 @@
+TEST REPORT – 2026-10-05
+
+PASS: engine.py Python compile
+PASS: server.py Python compile
+PASS: seed replay from supplied M5 + M1
+PASS: seed last_bar = 2026-10-05T15:51:00-04:00
+PASS: completed_sessions = 20
+PASS: 2026-10-05 context = RANGE
+PASS: no open paper position at seed end
+PASS: reproduced S3-D SHORT signal at 11:55 ET and paper entry 90.07 at 11:56 ET
+PASS: reproduced 20:00 Berlin flat with +$62.80 paper PnL
+PASS: 600 concurrent /bridge/status requests in local stress test -> 600 HTTP 200, 0 SQLite lock errors
+PASS: stale M1 /tv request -> HTTP 200 STALE_OR_DUPLICATE
+PASS: synthetic 50K risk check: S3-D blocked; S3-B admitted and reserves $807.20

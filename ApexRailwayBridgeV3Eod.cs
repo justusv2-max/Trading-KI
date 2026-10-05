@@ -46,7 +46,7 @@ namespace OpenAI.ApexBridge
         public int MaxSignalAgeSeconds { get; set; } = 75;
 
         [Display(Name = "Polling (ms)", GroupName = "Bridge", Order = 70)]
-        public int PollMilliseconds { get; set; } = 500;
+        public int PollMilliseconds { get; set; } = 1500;
 
         [Display(Name = "Apex EOD Profil", GroupName = "Sicherheit", Order = 80)]
         public string AccountProfile { get; set; } = "50K_EOD_EVAL";
@@ -96,7 +96,7 @@ namespace OpenAI.ApexBridge
                 catch (Exception ex)
                 {
                     var now = DateTimeOffset.UtcNow;
-                    if (now - _lastErrorNotice > TimeSpan.FromSeconds(30)) { _lastErrorNotice = now; RaiseShowNotification($"Bridge V2 Polling: {ex.Message}"); }
+                    if (now - _lastErrorNotice > TimeSpan.FromSeconds(30)) { _lastErrorNotice = now; RaiseShowNotification($"Bridge V3 Polling: {ex.Message}"); }
                 }
                 await Delay(ct);
             }
