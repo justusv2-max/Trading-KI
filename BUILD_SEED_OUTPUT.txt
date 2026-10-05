@@ -1,0 +1,22 @@
+{
+  "m1_file": "tradingview_m1_current.csv",
+  "m1_sha256": "c501d4a53cfd21f95eae38c1b6b010045427d6f49c4249f8ee5b012579974266",
+  "m1_rows": 18134,
+  "m1_first_utc": "2026-09-16T02:16:00+00:00",
+  "m1_last_utc": "2026-10-05T06:17:00+00:00",
+  "m5_file": "tradingview_m5_current.csv",
+  "m5_sha256": "f44683591eb0de6c5479a4b8cf83b44fae6f65872a110511f278cb7e7bf1735a",
+  "m5_rows": 19298,
+  "m5_first_utc": "2026-06-26T16:20:00+00:00",
+  "m5_last_utc": "2026-10-02T20:55:00+00:00",
+  "m5_warmup_rows_used": 15762,
+  "seed_last_bar": "2026-10-05T02:17:00-04:00",
+  "completed_sessions": 20,
+  "week_context_keys": 15,
+  "month_context_keys": 5,
+  "s2_daily_ranges": 13,
+  "pending_s2_limits": 0,
+  "open_paper_positions": 0,
+  "s3_pending_cleared": true,
+  "note": "M5 is used only before first M1. From first M1 onward M30/TPO/value-area context is built causally from M1."
+}

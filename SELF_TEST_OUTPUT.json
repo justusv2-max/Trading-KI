@@ -1,0 +1,40 @@
+{
+  "PASS": true,
+  "health": {
+    "ok": true,
+    "ready": true,
+    "last_bar": "2026-10-05T02:17:00-04:00",
+    "completed_sessions": 20,
+    "mode": "APEX",
+    "execution": "ATAS_BRIDGE_V3_ACCOUNT_AWARE",
+    "master": "S2+S3 A/B/C/D | frozen $1400/max9 strategy gate + Apex EOD account safety",
+    "profiles": [
+      "50K_EOD_EVAL",
+      "100K_EOD_EVAL",
+      "50K_EOD_PA",
+      "100K_EOD_PA"
+    ],
+    "seed_last_bar": "2026-10-05T02:17:00-04:00",
+    "state_schema_migration": true
+  },
+  "duplicate": {
+    "ok": true,
+    "accepted": "STALE_OR_DUPLICATE",
+    "event_id": "DUP",
+    "timestamp": "2026-10-05T06:17:00+00:00",
+    "last_bar": "2026-10-05T02:17:00-04:00"
+  },
+  "next_timestamp": "2026-10-05T02:18:00-04:00",
+  "risk": {
+    "profile": "50K_EOD_EVAL",
+    "vendor": "RITHMIC",
+    "balance": 50000.0,
+    "eod_threshold": 48000.0,
+    "dll": 1000.0,
+    "day_realized": 0.0,
+    "day_entries": 0,
+    "dll_paused": false,
+    "reserved_risk": 0.0,
+    "open_stop_risk": 0.0
+  }
+}
