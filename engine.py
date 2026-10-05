@@ -4,13 +4,16 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import deque, Counter
 from typing import Optional
-import math
+import math, struct
 NY=ZoneInfo('America/New_York'); BERLIN=ZoneInfo('Europe/Berlin')
 TICK=.01; TICK_VALUE=10.0; FEE=7.20
 BULL={'TREND_BULL','MONTHLY_BULL','WEEKLY_BULL'}; BEAR={'TREND_BEAR','MONTHLY_BEAR','WEEKLY_BEAR'}
 NON_TREND={'MONTHLY_BULL','MONTHLY_BEAR','WEEKLY_BULL','WEEKLY_BEAR','RANGE'}
 
 def cents(x): return int(round(float(x)*100))
+def f32(x):
+    """Round exactly to IEEE-754 float32 (needed to reproduce frozen S3-B/D research cache semantics)."""
+    return struct.unpack('!f',struct.pack('!f',float(x)))[0]
 def px(x): return x/100.0
 
 def session_id(ts:datetime):
@@ -24,7 +27,7 @@ def value_area(bars):
     if not cnt:return None
     poc=min(k for k,v in cnt.items() if v==max(cnt.values())); lo=hi=poc; cov=cnt[poc]; target=.70*sum(cnt.values()); floor=min(cnt);ceil=max(cnt)
     while cov<target:
-        dn=cnt.get(lo-1,-1) if lo>floor else -1; up=cnt.get(hi+1,-1) if hi<ceil else -1
+        dn=cnt.get(lo-1,0) if lo>floor else -1; up=cnt.get(hi+1,0) if hi<ceil else -1
         if dn<0 and up<0:break
         if dn>=up: lo-=1;cov+=cnt[lo]
         else: hi+=1;cov+=cnt[hi]
@@ -68,10 +71,13 @@ class Engine:
     last_ts:str|None=None
     mode:str='APEX'
     risk_day:str|None=None; risk_day_realized:float=0.0; risk_day_trades:int=0
-    risk_equity:float=0.0; risk_peak:float=0.0; risk_start_dd:float=0.0; risk_base_budget:float=825.0
+    risk_equity:float=0.0; risk_peak:float=0.0; risk_start_dd:float=0.0; risk_base_budget:float=1400.0
+    # Frozen S2 uses prior five completed 09:00-15:00 ET ranges, with the hard Berlin <20:00 cutoff.
+    s2_daily_ranges:dict=field(default_factory=dict)
 
 
-    RISK_MAP={'HV-1':157.2,'HV-2':157.2,'LV-1':87.2,'LV-2':87.2,'LV-3':87.2,'S3-A':1827.2,'S3-B':807.2,'S3-C':1007.2,'S3-D':1407.2}
+    RISK_MAP={'HV-1':150.0,'HV-2':150.0,'LV-1':80.0,'LV-2':80.0,'LV-3':80.0,
+              'S3-A':1400.0,'S3-B':800.0,'S3-C':1000.0,'S3-D':1400.0}
     def set_mode(self,mode):
         mode=str(mode).upper()
         if mode not in {'APEX','EK'}: raise ValueError('TRADING_MODE must be APEX or EK')
@@ -83,10 +89,10 @@ class Engine:
             self.risk_equity += self.risk_day_realized; self.risk_peak=max(self.risk_peak,self.risk_equity)
             self.risk_day=d; self.risk_day_realized=0.0; self.risk_day_trades=0; self.risk_start_dd=self.risk_equity-self.risk_peak; self._risk_set_base()
     def _risk_set_base(self):
-        # APEX protection phase: fixed preventive budget.
-        # This is intentionally conservative while the account buffer is small.
-        self.risk_base_budget=825.0
-    def _risk_effective_budget(self): return 825.0
+        # APEX 100K: fixed $1,400 nominal preventive risk budget.
+        # Candidate risk excludes commission; realized PnL already includes the $7.20 round-trip fee.
+        self.risk_base_budget=1400.0
+    def _risk_effective_budget(self): return 1400.0
     def _risk_allow(self,setup):
         if self.mode=='EK': return True,'EK_UNLIMITED'
         if self.risk_day_trades>=9:return False,'APEX_MAX_9_TRADES'
@@ -107,6 +113,20 @@ class Engine:
         atr=sum(x['range_ticks'] for x in done[-5:])/5 if len(done)>=5 else None
         pmom=done[-1]['mom_ticks'] if done else None
         return atr,pmom
+    def _features_bd(self):
+        done=[self.session_stats[x] for x in self.completed_sessions if x in self.session_stats]
+        if not done:return None,None
+        rr=[]
+        for x in done[-5:]:
+            H=f32(x['H']); L=f32(x['L'])
+            rr.append(f32(f32(H-L)*100.0))
+        atr=sum(rr)/5.0 if len(rr)>=5 else None
+        x=done[-1]; pmom=f32(f32(f32(x['C'])-f32(x['O']))*100.0)
+        return atr,pmom
+    def _s2_atr5(self,current_ny_date):
+        keys=sorted(k for k in self.s2_daily_ranges if k<current_ny_date)
+        if len(keys)<5:return None
+        return sum(self.s2_daily_ranges[k]['range_ticks'] for k in keys[-5:])/5.0
     def _finish_m30(self):
         if not self.m30_ohlc:return
         x=self.m30_ohlc; start=datetime.fromisoformat(x['start']).astimezone(NY)
@@ -124,7 +144,7 @@ class Engine:
         self.s2_day=d;self.s2_index=0;self.s2_hi=None;self.s2_lo=None;self.s2_extreme=None;self.pending_limits=[];self.used_buckets=set();self.lv2_filled=False
     def _s2_add(self,setup,d,z,first,active=True):
         bucket=int(round(z/50))*50
-        if bucket in self.used_buckets:return None
+        if (setup,bucket) in self.used_buckets:return None
         if setup=='LV-2' and self.lv2_filled:return None
         if any(x.setup==setup and x.zone==z for x in self.pending_limits):return None
         L=Limit(setup,d,z,first,first+79,0,active);self.pending_limits.append(L)
@@ -135,9 +155,10 @@ class Engine:
         keep=[]
         bt=datetime.fromisoformat(bar['timestamp']).astimezone(BERLIN)
         for p in self.positions:
-            if bt.hour>=20:
+            opened_bt=datetime.fromisoformat(p.opened_at).astimezone(BERLIN)
+            if bt.date()!=opened_bt.date() or bt.hour>=20:
                 xp=bar['open'];pnl=p.direction*(xp-p.entry)*1000-FEE
-                self._risk_exit(pnl); events.append({'kind':'PAPER_EXIT','setup':p.setup,'outcome':'berlin_20_flat','pnl_net':round(pnl,4)})
+                self._risk_exit(pnl); events.append({'kind':'PAPER_EXIT','setup':p.setup,'outcome':'berlin_date_or_20_flat','pnl_net':round(pnl,4)})
                 continue
             stop=(p.direction==1 and l<=p.stop) or (p.direction==-1 and h>=p.stop)
             target=(p.direction==1 and h>=p.target) or (p.direction==-1 and l<=p.target)
@@ -155,7 +176,7 @@ class Engine:
                 if not allowed:
                     self.pending_limits.remove(L); events.append({'kind':'RISK_BLOCK','setup':L.setup,'reason':reason,'realized_day':round(self.risk_day_realized,4),'effective_budget':round(self._risk_effective_budget(),4)}); continue
                 sl,tp=(15,15) if L.setup.startswith('HV') else (8,8);p=Position(L.setup,L.direction,px(L.zone),sl,tp,bar['timestamp'])
-                self.positions.append(p);self._risk_entry();self.used_buckets.add(int(round(L.zone/50))*50);self.pending_limits.remove(L)
+                self.positions.append(p);self._risk_entry();self.used_buckets.add((L.setup,int(round(L.zone/50))*50));self.pending_limits.remove(L)
                 if L.setup=='LV-2':self.lv2_filled=True
                 events.append({'kind':'S2_FILL','setup':L.setup,'direction':L.direction,'entry':p.entry,'sl':p.stop,'target':p.target,'trading_mode':self.mode})
         return events
@@ -198,7 +219,14 @@ class Engine:
         d=ts.date().isoformat(); self._risk_roll_day(d)
         if ts.hour==9 and d not in self.day_open9:
             self.day_open9[d]=bar['open'];pw,pm=self._period_levels(ts);self.day_context[d]=classify(bar['open'],pw,pm)
-        ctx=self.day_context.get(d);atr,pmom=self._features();events=[]
+        ctx=self.day_context.get(d);atr,pmom=self._features();atr_bd,pmom_bd=self._features_bd()
+        bt=ts.astimezone(BERLIN)
+        if 9 <= ts.hour < 15 and bt.hour < 20 and bt.weekday()<5:
+            ds=self.s2_daily_ranges.setdefault(d,{'H':bar['high'],'L':bar['low'],'range_ticks':0.0})
+            ds['H']=max(ds['H'],bar['high']); ds['L']=min(ds['L'],bar['low'])
+            ds['range_ticks']=(ds['H']-ds['L'])*100.0
+        atr_s2=self._s2_atr5(d)
+        events=[]
         # paper exits then S2 fills on this completed bar (stop-first is enforced in next evaluation for pre-existing positions)
         events+=self._eval_positions(bar)
         in_s2_window = 9 <= ts.hour < 15
@@ -215,8 +243,8 @@ class Engine:
         self.s3_pending=[];events+=self._eval_positions(bar)
         # only build signals once causal context/features exist and next minute is before Berlin cutoff
         if ctx and atr is not None and pmom is not None and berlin_entry_ok(ts+timedelta(minutes=1)):
-            if in_s2_window: events+=self._s2_signals(bar,ctx,atr,d)
-            events+=self._s3_signals(bar,ctx,atr,pmom)
+            if in_s2_window and atr_s2 is not None: events+=self._s2_signals(bar,ctx,atr_s2,d)
+            events+=self._s3_signals(bar,ctx,atr,pmom,atr_bd,pmom_bd)
         # S2 running extreme/index exist only inside authoritative 09:00-15:00 ET window
         if in_s2_window:
             zhi,zlo=cents(bar['high']),cents(bar['low']); nh=self.s2_hi is None or zhi>self.s2_hi;nl=self.s2_lo is None or zlo<self.s2_lo
@@ -250,25 +278,53 @@ class Engine:
                 q=self._s2_add('LV-2',di,z,i+1,False)
                 if q:ev.append(q)
         return ev
-    def _s3_signals(self,b,ctx,atr,pmom):
+    def _s3_signals(self,b,ctx,atr,pmom,atr_bd=None,pmom_bd=None):
         if ctx not in NON_TREND:return []
-        hist=self.bars; o,h,l,c=b['open'],b['high'],b['low'],b['close']; rng=max(h-l,1e-12); body=abs(c-o)/rng; out=[]
+        bt=datetime.fromisoformat(b['timestamp']).astimezone(BERLIN)
+        # Frozen S3 A/B/C/D signal window: 10:00 <= Berlin signal time < 20:00.
+        if bt.weekday()>=5 or bt.hour<10 or bt.hour>=20:return []
+        hist=self.bars
+        o,h,l,c=b['open'],b['high'],b['low'],b['close']
+        rng=max(h-l,1e-12); body=abs(c-o)/rng; out=[]
         def emit(name,d,sl,tp):
-            q={'kind':'S3_SIGNAL','setup':name,'direction':d,'entry_rule':'NEXT_M1_OPEN','sl_ticks':sl,'tp_ticks':tp};out.append(q);self.s3_pending.append(q)
+            # Frozen S3 execution: one open trade per setup; other setups may overlap.
+            if any(p.setup==name for p in self.positions): return
+            if any(q.get('setup')==name for q in self.s3_pending): return
+            q={'kind':'S3_SIGNAL','setup':name,'direction':d,'entry_rule':'NEXT_M1_OPEN','sl_ticks':sl,'tp_ticks':tp}
+            out.append(q);self.s3_pending.append(q)
+
+        # A: float64/raw-master branch
         if 100<atr<=150 and len(hist)>=6 and body>=.8:
             ph=max(x['high'] for x in hist[-6:]);pl=min(x['low'] for x in hist[-6:])
             if c>ph and c>o:emit('S3-A',1,140,60)
             elif c<pl and c<o:emit('S3-A',-1,140,60)
-        if 150<atr<=200 and abs(pmom)<40 and len(hist)>=7 and body>=.5:
-            mom=(hist[-1]['close']-hist[-7]['close'])*100
-            if mom>=12 and c>o:emit('S3-B',1,80,25)
-            elif mom<=-12 and c<o:emit('S3-B',-1,80,25)
+
+        # B: frozen B/D research cache was float32. Reproduce its exact threshold semantics.
+        if atr_bd is not None and pmom_bd is not None and 150<atr_bd<=200 and abs(pmom_bd)<40 and len(hist)>=7:
+            o32,c32,h32,l32=map(f32,(o,c,h,l))
+            den=f32(max(f32(h32-l32),f32(1e-9)))
+            body32=f32(f32(abs(f32(c32-o32)))/den)
+            c1=f32(hist[-1]['close']); c7=f32(hist[-7]['close'])
+            mom=f32(f32(c1-c7)*100.0)
+            if body32>=f32(.5):
+                if mom>=f32(12) and c32>o32:emit('S3-B',1,80,25)
+                elif mom<=f32(-12) and c32<o32:emit('S3-B',-1,80,25)
+
+        # C: float64/raw-master branch
         if atr>200 and len(hist)>=24 and body>=.2:
             ph=max(x['high'] for x in hist[-24:]);pl=min(x['low'] for x in hist[-24:])
             if l<=pl-.05 and c>pl and c>o and pmom<=-30:emit('S3-C',1,100,45)
             elif h>=ph+.05 and c<ph and c<o and pmom>=30:emit('S3-C',-1,100,45)
-        if atr>400 and len(hist)>=5 and body>=.8:
-            mom=(hist[-1]['close']-hist[-5]['close'])*100
-            if mom>=20 and c>o and pmom>=60:emit('S3-D',1,140,45)
-            elif mom<=-20 and c<o and pmom<=-60:emit('S3-D',-1,140,45)
+
+        # D: same float32 provenance as frozen B.
+        if atr_bd is not None and pmom_bd is not None and atr_bd>400 and len(hist)>=5:
+            o32,c32,h32,l32=map(f32,(o,c,h,l))
+            den=f32(max(f32(h32-l32),f32(1e-9)))
+            body32=f32(f32(abs(f32(c32-o32)))/den)
+            c1=f32(hist[-1]['close']); c5=f32(hist[-5]['close'])
+            mom=f32(f32(c1-c5)*100.0)
+            if body32>=f32(.8):
+                if mom>=f32(20) and c32>o32 and pmom_bd>=f32(60):emit('S3-D',1,140,45)
+                elif mom<=f32(-20) and c32<o32 and pmom_bd<=f32(-60):emit('S3-D',-1,140,45)
         return out
+
